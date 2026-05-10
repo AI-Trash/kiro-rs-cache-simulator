@@ -58,6 +58,7 @@ struct Config {
     host: String,
     port: u16,
     upstream: String,
+    debug_cache_keys: bool,
 }
 
 fn default_host() -> String {
@@ -109,8 +110,21 @@ impl Config {
             host: file_config.host,
             port: file_config.port,
             upstream: upstream.trim_end_matches('/').to_string(),
+            debug_cache_keys: env_flag("CACHE_SIMULATOR_DEBUG_KEYS"),
         })
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn first_non_empty(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
@@ -126,6 +140,7 @@ struct AppState {
     upstream: String,
     client: reqwest::Client,
     cache: MemoryCache,
+    debug_cache_keys: bool,
 }
 
 type MemoryCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
@@ -169,6 +184,48 @@ struct CacheResult {
     uncached_input_tokens: i32,
 }
 
+#[derive(Debug, Clone)]
+struct CacheDebugSummary {
+    api_key_hash: String,
+    prefix_count: usize,
+    breakpoint_prefixes: String,
+}
+
+fn cache_debug_summary(
+    api_key: &str,
+    prefixes: &[CachePrefix],
+    breakpoints: &[CacheBreakpoint],
+) -> CacheDebugSummary {
+    let breakpoint_prefixes = breakpoints
+        .iter()
+        .filter_map(|breakpoint| {
+            prefixes.get(breakpoint.prefix_index).map(|prefix| {
+                format!(
+                    "{}:{}:{}",
+                    breakpoint.prefix_index,
+                    prefix.tokens,
+                    short_hash(&prefix.hash)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    CacheDebugSummary {
+        api_key_hash: short_hash(&sha256_hex(api_key.as_bytes())),
+        prefix_count: prefixes.len(),
+        breakpoint_prefixes,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -187,6 +244,7 @@ async fn main() -> Result<()> {
         upstream: config.upstream.clone(),
         client: reqwest::Client::builder().build()?,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        debug_cache_keys: config.debug_cache_keys,
     };
 
     let app = Router::new()
@@ -242,6 +300,9 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
     let cache_result = match cache_plan {
         Some(plan) if status.is_success() && !upstream_has_cache_usage => {
             let breakpoint_count = plan.breakpoints.len();
+            let debug = state
+                .debug_cache_keys
+                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
             let result = lookup_or_create(
                 &state.cache,
                 &plan.api_key,
@@ -250,15 +311,21 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
                 plan.total_input_tokens,
             )
             .await;
-            cache_log = Some((true, breakpoint_count, result.clone()));
+            cache_log = Some((true, breakpoint_count, result.clone(), debug));
             Some(result)
         }
         Some(plan) if upstream_has_cache_usage => {
-            cache_log = Some((false, plan.breakpoints.len(), CacheResult::default()));
+            let debug = state
+                .debug_cache_keys
+                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+            cache_log = Some((false, plan.breakpoints.len(), CacheResult::default(), debug));
             None
         }
         Some(plan) => {
-            cache_log = Some((false, plan.breakpoints.len(), CacheResult::default()));
+            let debug = state
+                .debug_cache_keys
+                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+            cache_log = Some((false, plan.breakpoints.len(), CacheResult::default(), debug));
             None
         }
         None => None,
@@ -270,18 +337,35 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
         response_body
     };
 
-    if let Some((applied, breakpoint_count, result)) = cache_log {
-        tracing::info!(
-            method = %method,
-            path = %path,
-            status = status.as_u16(),
-            cache_applied = applied,
-            breakpoints = breakpoint_count,
-            cache_read_input_tokens = result.cache_read_input_tokens,
-            cache_creation_input_tokens = result.cache_creation_input_tokens,
-            uncached_input_tokens = result.uncached_input_tokens,
-            "cache calculation completed after proxy pass-through"
-        );
+    if let Some((applied, breakpoint_count, result, debug)) = cache_log {
+        if let Some(debug_summary) = debug {
+            tracing::info!(
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                cache_applied = applied,
+                breakpoints = breakpoint_count,
+                cache_read_input_tokens = result.cache_read_input_tokens,
+                cache_creation_input_tokens = result.cache_creation_input_tokens,
+                uncached_input_tokens = result.uncached_input_tokens,
+                api_key_hash = %debug_summary.api_key_hash,
+                prefix_count = debug_summary.prefix_count,
+                breakpoint_prefixes = %debug_summary.breakpoint_prefixes,
+                "cache calculation completed after proxy pass-through"
+            );
+        } else {
+            tracing::info!(
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                cache_applied = applied,
+                breakpoints = breakpoint_count,
+                cache_read_input_tokens = result.cache_read_input_tokens,
+                cache_creation_input_tokens = result.cache_creation_input_tokens,
+                uncached_input_tokens = result.uncached_input_tokens,
+                "cache calculation completed after proxy pass-through"
+            );
+        }
     }
 
     build_response(status, &response_headers, body)
