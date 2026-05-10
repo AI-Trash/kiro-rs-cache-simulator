@@ -15,24 +15,22 @@
 
 ## 配置
 
-创建 `cache-simulator.json`：
-
-```json
-{
-  "upstream": "http://127.0.0.1:8080",
-  "host": "0.0.0.0",
-  "port": 8990
-}
-```
-
-也可以用环境变量或命令行覆盖：
+只支持命令行参数和环境变量，不读取配置文件。
 
 ```bash
 UPSTREAM=http://127.0.0.1:8080 cargo run --manifest-path kiro-rs-cache-simulator/Cargo.toml
 cargo run --manifest-path kiro-rs-cache-simulator/Cargo.toml -- --upstream http://127.0.0.1:8080
 ```
 
-兼容旧配置名 `sourceUrl` 和旧参数 `--source-url`，但新配置推荐使用 `upstream` / `UPSTREAM`。
+可配置项只有三个：
+
+| 命令行 | 环境变量 | 默认值 |
+| --- | --- | --- |
+| `--upstream` | `UPSTREAM` | 必填 |
+| `--host` | `HOST` | `0.0.0.0` |
+| `--port` | `PORT` | `8990` |
+
+命令行参数优先于环境变量。
 
 ## 构建
 
@@ -65,7 +63,7 @@ services:
 ## 使用
 
 1. 先启动真实 `kiro-rs`，例如暴露在 `http://127.0.0.1:8080`。
-2. 启动模拟器并配置 `upstream` / `UPSTREAM` 指向真实服务。
+2. 启动模拟器并通过 `--upstream` 或 `UPSTREAM` 指向真实服务。
 3. 客户端改为请求 `http://127.0.0.1:8990/v1/messages` 或 `/cc/v1/messages`。
 
 缓存键按 `cache:{apiKey}:{hash}` 隔离，`apiKey` 来自 `x-api-key` 或 `Authorization: Bearer ...`。
