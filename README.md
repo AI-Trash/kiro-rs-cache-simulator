@@ -5,7 +5,7 @@
 ## 行为
 
 - 监听 `0.0.0.0:8990`（可配置）。
-- 通过 `sourceUrl` 转发所有请求到真实 `kiro-rs`。
+- 通过 `upstream` 转发所有请求到真实 `kiro-rs`。
 - 仅对 `POST /v1/messages` 与 `POST /cc/v1/messages` 计算 PR #57 风格的缓存断点。
 - 不依赖 Redis；缓存保存在进程内存中，重启即清空。
 - 默认日志只输出错误，以及每次透传完成后的缓存计算摘要。
@@ -19,17 +19,20 @@
 
 ```json
 {
-  "sourceUrl": "http://127.0.0.1:8080",
+  "upstream": "http://127.0.0.1:8080",
   "host": "0.0.0.0",
   "port": 8990
 }
 ```
 
-也可以用命令行覆盖：
+也可以用环境变量或命令行覆盖：
 
 ```bash
-cargo run --manifest-path kiro-rs-cache-simulator/Cargo.toml -- --source-url http://127.0.0.1:8080
+UPSTREAM=http://127.0.0.1:8080 cargo run --manifest-path kiro-rs-cache-simulator/Cargo.toml
+cargo run --manifest-path kiro-rs-cache-simulator/Cargo.toml -- --upstream http://127.0.0.1:8080
 ```
+
+兼容旧配置名 `sourceUrl` 和旧参数 `--source-url`，但新配置推荐使用 `upstream` / `UPSTREAM`。
 
 ## 构建
 
@@ -40,8 +43,9 @@ cargo build --manifest-path kiro-rs-cache-simulator/Cargo.toml --release
 ## Docker
 
 ```bash
-docker run --rm -p 8990:8990 ghcr.io/ai-trash/kiro-rs-cache-simulator:latest \
-  --source-url http://host.docker.internal:8080
+docker run --rm -p 8990:8990 \
+  -e UPSTREAM=http://host.docker.internal:8080 \
+  ghcr.io/ai-trash/kiro-rs-cache-simulator:latest
 ```
 
 Docker Compose 示例：
@@ -52,17 +56,16 @@ services:
     image: ghcr.io/ai-trash/kiro-rs-cache-simulator:latest
     ports:
       - "8990:8990"
-    command:
-      - --source-url
-      - http://host.docker.internal:8080
+    environment:
+      UPSTREAM: http://host.docker.internal:8080
 ```
 
-如果 `kiro-rs` 也在同一个 Compose 网络里运行，把 `sourceUrl` 改成对应服务名即可，例如 `http://kiro-rs:8080`。
+如果 `kiro-rs` 也在同一个 Compose 网络里运行，把 `UPSTREAM` 改成对应服务名即可，例如 `http://kiro-rs:8080`。
 
 ## 使用
 
 1. 先启动真实 `kiro-rs`，例如暴露在 `http://127.0.0.1:8080`。
-2. 启动模拟器并配置 `sourceUrl` 指向真实服务。
+2. 启动模拟器并配置 `upstream` / `UPSTREAM` 指向真实服务。
 3. 客户端改为请求 `http://127.0.0.1:8990/v1/messages` 或 `/cc/v1/messages`。
 
 缓存键按 `cache:{apiKey}:{hash}` 隔离，`apiKey` 来自 `x-api-key` 或 `Authorization: Bearer ...`。
