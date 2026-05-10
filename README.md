@@ -44,6 +44,21 @@ docker run --rm -p 8990:8990 ghcr.io/ai-trash/kiro-rs-cache-simulator:latest \
   --source-url http://host.docker.internal:8080
 ```
 
+Docker Compose 示例：
+
+```yaml
+services:
+  kiro-rs-cache-simulator:
+    image: ghcr.io/ai-trash/kiro-rs-cache-simulator:latest
+    ports:
+      - "8990:8990"
+    command:
+      - --source-url
+      - http://host.docker.internal:8080
+```
+
+如果 `kiro-rs` 也在同一个 Compose 网络里运行，把 `sourceUrl` 改成对应服务名即可，例如 `http://kiro-rs:8080`。
+
 ## 使用
 
 1. 先启动真实 `kiro-rs`，例如暴露在 `http://127.0.0.1:8080`。
