@@ -8,11 +8,13 @@ use axum::{
     routing::any,
 };
 use clap::Parser;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{net::TcpListener, sync::Mutex};
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 const DEFAULT_TTL_SECS: u64 = 5 * 60;
@@ -309,6 +311,48 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
 
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
+
+    let is_sse = response_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
+
+    if is_sse {
+        handle_sse_streaming(
+            state,
+            upstream,
+            status,
+            response_headers,
+            cache_plan,
+            method,
+            path,
+        )
+        .await
+    } else {
+        handle_buffered(
+            state,
+            upstream,
+            status,
+            response_headers,
+            cache_plan,
+            method,
+            path,
+        )
+        .await
+    }
+}
+
+async fn handle_buffered(
+    state: AppState,
+    upstream: reqwest::Response,
+    status: reqwest::StatusCode,
+    response_headers: reqwest::header::HeaderMap,
+    cache_plan: Option<CachePlan>,
+    method: Method,
+    path: String,
+) -> Result<Response<Body>> {
     let response_body = upstream
         .bytes()
         .await
@@ -352,17 +396,177 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
     };
 
     let body = if let Some(cache_result) = cache_result {
-        inject_cache_fields(&response_headers, response_body, &cache_result)
+        inject_json_cache_fields(response_body, &cache_result)
     } else {
         response_body
     };
 
+    emit_cache_log(&method, &path, status.as_u16(), cache_log);
+    build_response(status, &response_headers, body)
+}
+
+async fn handle_sse_streaming(
+    state: AppState,
+    upstream: reqwest::Response,
+    status: reqwest::StatusCode,
+    response_headers: reqwest::header::HeaderMap,
+    cache_plan: Option<CachePlan>,
+    method: Method,
+    path: String,
+) -> Result<Response<Body>> {
+    let cache_result = match &cache_plan {
+        Some(plan) if status.is_success() => Some(
+            lookup_or_create(
+                &state.cache,
+                &plan.api_key,
+                &plan.prefixes,
+                &plan.breakpoints,
+                plan.total_input_tokens,
+            )
+            .await,
+        ),
+        _ => None,
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let stream_body = Body::from_stream(ReceiverStream::new(rx));
+
+    let cache_result_for_task = cache_result.clone();
+    let plan_for_log = cache_plan.clone();
+    let state_for_task = state.clone();
+    let method_for_task = method.clone();
+    let path_for_task = path.clone();
+
+    tokio::spawn(async move {
+        let mut byte_stream = upstream.bytes_stream();
+        let mut line_buffer = String::new();
+        let mut upstream_has_cache = false;
+        let mut checked_upstream_cache = false;
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+
+            let text = match std::str::from_utf8(&chunk) {
+                Ok(t) => t.to_string(),
+                Err(_) => {
+                    let _ = tx.send(Ok(chunk)).await;
+                    continue;
+                }
+            };
+
+            line_buffer.push_str(&text);
+
+            while let Some(newline_pos) = line_buffer.find('\n') {
+                let line = line_buffer[..newline_pos].to_string();
+                line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                let output_line =
+                    if !upstream_has_cache && !checked_upstream_cache && line.starts_with("data: ")
+                    {
+                        let data = &line["data: ".len()..];
+                        if data != "[DONE]" {
+                            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                if json_has_cache_usage_fields(&event) {
+                                    upstream_has_cache = true;
+                                    checked_upstream_cache = true;
+                                } else {
+                                    checked_upstream_cache = true;
+                                }
+                            }
+                        }
+
+                        if upstream_has_cache {
+                            format!("{}\n", line)
+                        } else if let Some(ref cache) = cache_result_for_task {
+                            patch_sse_line(&line, cache)
+                        } else {
+                            format!("{}\n", line)
+                        }
+                    } else if !upstream_has_cache {
+                        if let Some(ref cache) = cache_result_for_task {
+                            patch_sse_line(&line, cache)
+                        } else {
+                            format!("{}\n", line)
+                        }
+                    } else {
+                        format!("{}\n", line)
+                    };
+
+                if tx.send(Ok(Bytes::from(output_line))).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        if !line_buffer.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(line_buffer))).await;
+        }
+
+        let cache_log = match plan_for_log {
+            Some(plan) if status.is_success() && !upstream_has_cache => {
+                let debug = state_for_task
+                    .debug_cache_keys
+                    .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+                Some((
+                    true,
+                    plan.breakpoints.len(),
+                    cache_result_for_task.unwrap_or_default(),
+                    debug,
+                ))
+            }
+            Some(plan) if upstream_has_cache => {
+                let debug = state_for_task
+                    .debug_cache_keys
+                    .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+                Some((false, plan.breakpoints.len(), CacheResult::default(), debug))
+            }
+            Some(plan) => {
+                let debug = state_for_task
+                    .debug_cache_keys
+                    .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+                Some((false, plan.breakpoints.len(), CacheResult::default(), debug))
+            }
+            None => None,
+        };
+
+        emit_cache_log(&method_for_task, &path_for_task, status.as_u16(), cache_log);
+    });
+
+    build_response(status, &response_headers, stream_body)
+}
+
+fn patch_sse_line(line: &str, cache: &CacheResult) -> String {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return format!("{}\n", line);
+    };
+    if data == "[DONE]" {
+        return format!("{}\n", line);
+    }
+    let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+        return format!("{}\n", line);
+    };
+    patch_sse_event(&mut event, cache);
+    match serde_json::to_string(&event) {
+        Ok(serialized) => format!("data: {}\n", serialized),
+        Err(_) => format!("{}\n", line),
+    }
+}
+
+fn emit_cache_log(
+    method: &Method,
+    path: &str,
+    status: u16,
+    cache_log: Option<(bool, usize, CacheResult, Option<CacheDebugSummary>)>,
+) {
     if let Some((applied, breakpoint_count, result, debug)) = cache_log {
         if let Some(debug_summary) = debug {
             tracing::info!(
                 method = %method,
                 path = %path,
-                status = status.as_u16(),
+                status = status,
                 cache_applied = applied,
                 breakpoints = breakpoint_count,
                 cache_read_input_tokens = result.cache_read_input_tokens,
@@ -378,7 +582,7 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
             tracing::info!(
                 method = %method,
                 path = %path,
-                status = status.as_u16(),
+                status = status,
                 cache_applied = applied,
                 breakpoints = breakpoint_count,
                 cache_read_input_tokens = result.cache_read_input_tokens,
@@ -388,8 +592,6 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
             );
         }
     }
-
-    build_response(status, &response_headers, body)
 }
 
 async fn forward_request(
@@ -419,7 +621,7 @@ async fn forward_request(
 fn build_response(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
-    body: Bytes,
+    body: impl Into<Body>,
 ) -> Result<Response<Body>> {
     let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16())?);
     let response_headers = builder
@@ -435,7 +637,7 @@ fn build_response(
         }
     }
 
-    Ok(builder.body(Body::from(body))?)
+    Ok(builder.body(body.into())?)
 }
 
 fn should_forward_request_header(name: &str) -> bool {
@@ -481,6 +683,7 @@ fn compute_request_cache_plan(
     cache_path.breakpoints.retain(|breakpoint| {
         cache_path.prefixes[breakpoint.prefix_index].tokens >= minimum_cache_tokens
     });
+    cache_path.breakpoints.truncate(4);
     let total_input_tokens = count_all_tokens(&request).max(1);
     Some(CachePlan {
         api_key: api_key.to_string(),
@@ -908,31 +1111,11 @@ fn is_non_western_char(ch: char) -> bool {
     )
 }
 
-fn inject_cache_fields(
-    headers: &reqwest::header::HeaderMap,
-    body: Bytes,
-    cache: &CacheResult,
-) -> Bytes {
-    if response_has_cache_usage_fields(headers, &body) {
+fn inject_json_cache_fields(body: Bytes, cache: &CacheResult) -> Bytes {
+    if json_body_has_cache_usage_fields(&body) {
         return body;
     }
 
-    let content_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if content_type.contains("text/event-stream") {
-        inject_sse_cache_fields(body, cache)
-    } else if content_type.contains("application/json") || content_type.is_empty() {
-        inject_json_cache_fields(body, cache)
-    } else {
-        body
-    }
-}
-
-fn inject_json_cache_fields(body: Bytes, cache: &CacheResult) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
         return body;
     };
@@ -946,38 +1129,6 @@ fn inject_json_cache_fields(body: Bytes, cache: &CacheResult) -> Bytes {
     } else {
         body
     }
-}
-
-fn inject_sse_cache_fields(body: Bytes, cache: &CacheResult) -> Bytes {
-    let Ok(text) = String::from_utf8(body.to_vec()) else {
-        return body;
-    };
-
-    let mut output = String::with_capacity(text.len() + 128);
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" {
-                output.push_str(line);
-                output.push('\n');
-                continue;
-            }
-
-            if let Ok(mut event) = serde_json::from_str::<Value>(data) {
-                patch_sse_event(&mut event, cache);
-                if let Ok(serialized) = serde_json::to_string(&event) {
-                    output.push_str("data: ");
-                    output.push_str(&serialized);
-                    output.push('\n');
-                    continue;
-                }
-            }
-        }
-
-        output.push_str(line);
-        output.push('\n');
-    }
-
-    Bytes::from(output)
 }
 
 fn patch_sse_event(event: &mut Value, cache: &CacheResult) {
@@ -1306,19 +1457,17 @@ mod tests {
 
     #[test]
     fn injects_sse_message_start_usage_cache_fields() {
-        let body = Bytes::from_static(
-            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
-        );
+        let line =
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}";
         let cache = CacheResult {
             cache_read_input_tokens: 7,
             cache_creation_input_tokens: 0,
             uncached_input_tokens: 1,
         };
 
-        let patched = inject_sse_cache_fields(body, &cache);
-        let text = String::from_utf8(patched.to_vec()).expect("valid utf8");
-        assert!(text.contains("\"cache_read_input_tokens\":7"));
-        assert!(text.contains("\"cache_creation_input_tokens\":0"));
+        let patched = patch_sse_line(line, &cache);
+        assert!(patched.contains("\"cache_read_input_tokens\":7"));
+        assert!(patched.contains("\"cache_creation_input_tokens\":0"));
     }
 
     #[test]
