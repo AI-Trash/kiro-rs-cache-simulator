@@ -552,7 +552,8 @@ fn compute_cache_path(request: &Value) -> CachePath {
             match message.get("content") {
                 Some(Value::Array(blocks)) => {
                     for block in blocks {
-                        let block_json = serde_json::to_string(block).unwrap_or_default();
+                        let block_json = serde_json::to_string(&block_cache_hash_material(block))
+                            .unwrap_or_default();
                         let block_tokens = block
                             .get("text")
                             .and_then(Value::as_str)
@@ -622,6 +623,16 @@ fn push_breakpoint(path: &mut CachePath, ttl_secs: u64) {
         prefix_index,
         ttl_secs,
     });
+}
+
+fn block_cache_hash_material(block: &Value) -> Value {
+    let Value::Object(map) = block else {
+        return block.clone();
+    };
+
+    let mut hashable = map.clone();
+    hashable.remove("cache_control");
+    Value::Object(hashable)
 }
 
 fn minimum_cache_tokens(request: &Value) -> i32 {
@@ -1038,6 +1049,55 @@ mod tests {
         assert!(second.cache_read_input_tokens > 0);
         assert!(second.cache_creation_input_tokens > 0);
         assert!(second.cache_creation_input_tokens < first.cache_creation_input_tokens * 2);
+    }
+
+    #[tokio::test]
+    async fn cache_control_metadata_does_not_change_message_block_hash() {
+        let prompt = long_text();
+        let first_request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+        let second_request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": prompt,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        });
+        let first_path = compute_cache_path(&first_request);
+        let second_path = compute_cache_path(&second_request);
+        let cache: MemoryCache = Arc::new(Mutex::new(HashMap::new()));
+
+        let first = lookup_or_create(
+            &cache,
+            "sk-test",
+            &first_path.prefixes,
+            &first_path.breakpoints,
+            count_all_tokens(&first_request),
+        )
+        .await;
+        assert!(first.cache_creation_input_tokens > 0);
+
+        let second = lookup_or_create(
+            &cache,
+            "sk-test",
+            &second_path.prefixes,
+            &second_path.breakpoints,
+            count_all_tokens(&second_request),
+        )
+        .await;
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert!(second.cache_read_input_tokens > 0);
     }
 
     #[test]
