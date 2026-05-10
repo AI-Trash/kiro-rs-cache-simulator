@@ -15,7 +15,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache \
     cargo build --release --locked \
-    && cp target/release/kiro-rs-cache-simulator /tmp/kiro-rs-cache-simulator
+    && cp target/release/kiro-rs-cache-simulator /tmp/kiro-rs-cache-simulator \
+    && sccache --show-stats
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
