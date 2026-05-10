@@ -42,19 +42,19 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
-            binary: kiro-rs-cache-simulator
-            archive: kiro-rs-cache-simulator-linux-x86_64.tar.gz
-            package: tar -czf dist/kiro-rs-cache-simulator-linux-x86_64.tar.gz -C target/release kiro-rs-cache-simulator
+            binary: claude-cache-simulator
+            archive: claude-cache-simulator-linux-x86_64.tar.gz
+            package: tar -czf dist/claude-cache-simulator-linux-x86_64.tar.gz -C target/release claude-cache-simulator
           - name: windows-x86_64
             os: windows-latest
-            binary: kiro-rs-cache-simulator.exe
-            archive: kiro-rs-cache-simulator-windows-x86_64.zip
-            package: Compress-Archive -Path target/release/kiro-rs-cache-simulator.exe -DestinationPath dist/kiro-rs-cache-simulator-windows-x86_64.zip
+            binary: claude-cache-simulator.exe
+            archive: claude-cache-simulator-windows-x86_64.zip
+            package: Compress-Archive -Path target/release/claude-cache-simulator.exe -DestinationPath dist/claude-cache-simulator-windows-x86_64.zip
           - name: macos-aarch64
             os: macos-14
-            binary: kiro-rs-cache-simulator
-            archive: kiro-rs-cache-simulator-macos-aarch64.tar.gz
-            package: tar -czf dist/kiro-rs-cache-simulator-macos-aarch64.tar.gz -C target/release kiro-rs-cache-simulator
+            binary: claude-cache-simulator
+            archive: claude-cache-simulator-macos-aarch64.tar.gz
+            package: tar -czf dist/claude-cache-simulator-macos-aarch64.tar.gz -C target/release claude-cache-simulator
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

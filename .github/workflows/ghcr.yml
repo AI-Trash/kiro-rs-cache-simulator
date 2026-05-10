@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/ai-trash/kiro-rs-cache-simulator
+  IMAGE_NAME: ghcr.io/ai-trash/claude-cache-simulator
 
 jobs:
   image:

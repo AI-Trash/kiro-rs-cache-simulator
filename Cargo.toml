@@ -1,10 +1,10 @@
 [package]
-name = "kiro-rs-cache-simulator"
+name = "claude-cache-simulator"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/AI-Trash/kiro-rs-cache-simulator"
-description = "Pure in-memory prompt-cache simulator proxy for kiro-rs"
+repository = "https://github.com/AI-Trash/claude-cache-simulator"
+description = "Pure in-memory Claude prompt-cache simulator proxy"
 
 [dependencies]
 anyhow = "1.0"

@@ -15,13 +15,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache \
     cargo build --release --locked \
-    && cp target/release/kiro-rs-cache-simulator /tmp/kiro-rs-cache-simulator \
+    && cp target/release/claude-cache-simulator /tmp/claude-cache-simulator \
     && sccache --show-stats
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /tmp/kiro-rs-cache-simulator /usr/local/bin/kiro-rs-cache-simulator
+COPY --from=builder /tmp/claude-cache-simulator /usr/local/bin/claude-cache-simulator
 EXPOSE 8990
-ENTRYPOINT ["/usr/local/bin/kiro-rs-cache-simulator"]
+ENTRYPOINT ["/usr/local/bin/claude-cache-simulator"]
