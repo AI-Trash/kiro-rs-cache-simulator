@@ -1,0 +1,6 @@
+target
+.git
+.github
+.env
+*.log
+cache-simulator.json
