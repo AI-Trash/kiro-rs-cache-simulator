@@ -11,6 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: 'true'
 
 jobs:
   test:
@@ -20,8 +22,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold
       - run: cargo fmt --check
       - run: cargo test --locked
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   binaries:
     name: Build ${{ matrix.name }} binary
@@ -50,7 +60,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install mold
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold
       - run: cargo build --release --locked
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'ubuntu-latest' && '-C link-arg=-fuse-ld=mold' || '' }}
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
       - run: mkdir dist
       - name: Package binary
         shell: pwsh
