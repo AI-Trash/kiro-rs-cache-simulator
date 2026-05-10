@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::cors::CorsLayer;
 
@@ -27,6 +27,9 @@ struct Args {
     config: PathBuf,
 
     #[arg(long)]
+    upstream: Option<String>,
+
+    #[arg(long, hide = true)]
     source_url: Option<String>,
 
     #[arg(long)]
@@ -38,12 +41,22 @@ struct Args {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Config {
+struct FileConfig {
     #[serde(default = "default_host")]
     host: String,
     #[serde(default = "default_port")]
     port: u16,
-    source_url: String,
+    #[serde(default)]
+    upstream: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    host: String,
+    port: u16,
+    upstream: String,
 }
 
 fn default_host() -> String {
@@ -56,41 +69,60 @@ fn default_port() -> u16 {
 
 impl Config {
     fn load(args: Args) -> Result<Self> {
-        let mut config = if args.config.exists() {
+        let mut file_config = if args.config.exists() {
             let content = std::fs::read_to_string(&args.config)
                 .with_context(|| format!("failed to read config {}", args.config.display()))?;
-            serde_json::from_str::<Config>(&content)
+            serde_json::from_str::<FileConfig>(&content)
                 .with_context(|| format!("failed to parse config {}", args.config.display()))?
-        } else if let Some(source_url) = args.source_url.clone() {
-            Config {
+        } else {
+            FileConfig {
                 host: default_host(),
                 port: default_port(),
-                source_url,
+                upstream: None,
+                source_url: None,
             }
-        } else {
-            return Err(anyhow!(
-                "sourceUrl is required in {} or via --source-url",
-                args.config.display()
-            ));
         };
 
-        if let Some(source_url) = args.source_url {
-            config.source_url = source_url;
-        }
         if let Some(host) = args.host {
-            config.host = host;
+            file_config.host = host;
         }
         if let Some(port) = args.port {
-            config.port = port;
+            file_config.port = port;
         }
-        config.source_url = config.source_url.trim_end_matches('/').to_string();
-        Ok(config)
+
+        let upstream = first_non_empty([
+            args.upstream,
+            args.source_url,
+            env::var("UPSTREAM").ok(),
+            file_config.upstream,
+            file_config.source_url,
+        ])
+        .ok_or_else(|| {
+            anyhow!(
+                "upstream is required via UPSTREAM, --upstream, or {}",
+                args.config.display()
+            )
+        })?;
+
+        Ok(Config {
+            host: file_config.host,
+            port: file_config.port,
+            upstream: upstream.trim_end_matches('/').to_string(),
+        })
     }
+}
+
+fn first_non_empty(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
 }
 
 #[derive(Clone)]
 struct AppState {
-    source_url: String,
+    upstream: String,
     client: reqwest::Client,
     cache: MemoryCache,
 }
@@ -139,7 +171,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid listen address {}:{}", config.host, config.port))?;
 
     let state = AppState {
-        source_url: config.source_url.clone(),
+        upstream: config.upstream.clone(),
         client: reqwest::Client::builder().build()?,
         cache: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -242,7 +274,7 @@ async fn forward_request(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<reqwest::Response> {
-    let url = format!("{}{}", state.source_url, path_and_query);
+    let url = format!("{}{}", state.upstream, path_and_query);
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
     let mut request = state.client.request(reqwest_method, url);
 
@@ -853,5 +885,32 @@ mod tests {
         );
 
         assert_eq!(extract_api_key(&headers), "sk-lowercase");
+    }
+
+    #[test]
+    fn file_config_accepts_upstream_and_legacy_source_url() {
+        let modern: FileConfig = serde_json::from_value(json!({
+            "upstream": "http://127.0.0.1:8080"
+        }))
+        .expect("modern config should parse");
+        assert_eq!(modern.upstream.as_deref(), Some("http://127.0.0.1:8080"));
+
+        let legacy: FileConfig = serde_json::from_value(json!({
+            "sourceUrl": "http://127.0.0.1:8081"
+        }))
+        .expect("legacy config should parse");
+        assert_eq!(legacy.source_url.as_deref(), Some("http://127.0.0.1:8081"));
+    }
+
+    #[test]
+    fn first_non_empty_trims_and_skips_empty_values() {
+        assert_eq!(
+            first_non_empty([
+                None,
+                Some("   ".to_string()),
+                Some(" http://upstream/ ".to_string())
+            ]),
+            Some("http://upstream/".to_string())
+        );
     }
 }
