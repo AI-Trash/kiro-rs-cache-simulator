@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     routing::any,
 };
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -22,8 +22,8 @@ const CACHE_LOOKBACK_BLOCKS: usize = 20;
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "kiro-rs-cache-simulator")]
-#[command(about = "Pure in-memory prompt-cache simulator for a running kiro-rs service")]
+#[command(name = "claude-cache-simulator")]
+#[command(about = "Pure in-memory Claude prompt-cache simulator proxy")]
 struct Args {
     #[arg(long)]
     upstream: Option<String>,
@@ -33,6 +33,18 @@ struct Args {
 
     #[arg(long)]
     port: Option<u16>,
+
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_simulate_cache")]
+    simulate_cache: bool,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_simulate_cache: bool,
+
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_strip_cch")]
+    strip_cch: bool,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_strip_cch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +53,8 @@ struct Config {
     port: u16,
     upstream: String,
     debug_cache_keys: bool,
+    simulate_cache: bool,
+    strip_cch: bool,
 }
 
 fn default_host() -> String {
@@ -76,20 +90,43 @@ impl Config {
             port,
             upstream: upstream.trim_end_matches('/').to_string(),
             debug_cache_keys: env_flag("CACHE_SIMULATOR_DEBUG_KEYS"),
+            simulate_cache: resolve_bool_toggle(
+                args.simulate_cache,
+                args.no_simulate_cache,
+                "SIMULATE_CACHE",
+                true,
+            ),
+            strip_cch: resolve_bool_toggle(args.strip_cch, args.no_strip_cch, "STRIP_CCH", true),
         })
     }
 }
 
-fn env_flag(name: &str) -> bool {
+fn resolve_bool_toggle(enable_cli: bool, disable_cli: bool, env_name: &str, default: bool) -> bool {
+    if enable_cli {
+        true
+    } else if disable_cli {
+        false
+    } else {
+        env_bool(env_name).unwrap_or(default)
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
     env::var(name)
         .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+        .and_then(|value| parse_bool(value.trim()))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env_bool(name).unwrap_or(false)
 }
 
 fn first_non_empty(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
@@ -106,6 +143,8 @@ struct AppState {
     client: reqwest::Client,
     cache: MemoryCache,
     debug_cache_keys: bool,
+    simulate_cache: bool,
+    strip_cch: bool,
 }
 
 type MemoryCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
@@ -216,7 +255,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "error,kiro_rs_cache_simulator=info".into()),
+                .unwrap_or_else(|_| "error,claude_cache_simulator=info".into()),
         )
         .init();
 
@@ -230,6 +269,8 @@ async fn main() -> Result<()> {
         client: reqwest::Client::builder().build()?,
         cache: Arc::new(Mutex::new(HashMap::new())),
         debug_cache_keys: config.debug_cache_keys,
+        simulate_cache: config.simulate_cache,
+        strip_cch: config.strip_cch,
     };
 
     let app = Router::new()
@@ -268,8 +309,16 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
     let body = to_bytes(req.into_body(), MAX_BODY_SIZE)
         .await
         .context("failed to read request body")?;
+    let body = if state.strip_cch {
+        strip_cch_from_request_body(&method, &path, &headers, body)
+    } else {
+        body
+    };
 
-    let cache_plan = compute_request_cache_plan(&method, &path, &headers, &body, &api_key);
+    let cache_plan = state
+        .simulate_cache
+        .then(|| compute_request_cache_plan(&method, &path, &headers, &body, &api_key))
+        .flatten();
     let upstream = forward_request(&state, &method, path_and_query, &headers, body.clone()).await?;
 
     let status = upstream.status();
@@ -377,24 +426,9 @@ async fn handle_sse_streaming(
     method: Method,
     path: String,
 ) -> Result<Response<Body>> {
-    let cache_result = match &cache_plan {
-        Some(plan) if status.is_success() => Some(
-            lookup_or_create(
-                &state.cache,
-                &plan.api_key,
-                &plan.prefixes,
-                &plan.breakpoints,
-                plan.total_input_tokens,
-            )
-            .await,
-        ),
-        _ => None,
-    };
-
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let stream_body = Body::from_stream(ReceiverStream::new(rx));
 
-    let cache_result_for_task = cache_result.clone();
     let plan_for_log = cache_plan.clone();
     let state_for_task = state.clone();
     let method_for_task = method.clone();
@@ -405,6 +439,8 @@ async fn handle_sse_streaming(
         let mut line_buffer = String::new();
         let mut upstream_has_cache = false;
         let mut checked_upstream_cache = false;
+        let mut cache_result: Option<CacheResult> = None;
+        let mut pending_lines: Vec<String> = Vec::new();
 
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
@@ -426,40 +462,95 @@ async fn handle_sse_streaming(
                 let line = line_buffer[..newline_pos].to_string();
                 line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                let output_line =
-                    if !upstream_has_cache && !checked_upstream_cache && line.starts_with("data: ")
-                    {
-                        let data = &line["data: ".len()..];
-                        if data != "[DONE]" {
-                            if let Ok(event) = serde_json::from_str::<Value>(data) {
-                                if json_has_cache_usage_fields(&event) {
-                                    upstream_has_cache = true;
-                                    checked_upstream_cache = true;
-                                } else {
-                                    checked_upstream_cache = true;
-                                }
+                if !checked_upstream_cache && line.starts_with("data: ") {
+                    let data = &line["data: ".len()..];
+                    if data != "[DONE]" {
+                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                            if json_has_cache_usage_fields(&event) {
+                                upstream_has_cache = true;
+                            }
+                            checked_upstream_cache = true;
+                        }
+                    }
+
+                    if checked_upstream_cache && !upstream_has_cache {
+                        // Upstream confirmed no cache fields — now safe to write local cache
+                        if let Some(ref plan) = plan_for_log {
+                            if status.is_success() {
+                                cache_result = Some(
+                                    lookup_or_create(
+                                        &state_for_task.cache,
+                                        &plan.api_key,
+                                        &plan.prefixes,
+                                        &plan.breakpoints,
+                                        plan.total_input_tokens,
+                                    )
+                                    .await,
+                                );
                             }
                         }
-
-                        if upstream_has_cache {
-                            format!("{}\n", line)
-                        } else if let Some(ref cache) = cache_result_for_task {
+                        // Flush pending lines with cache patching
+                        for pending in pending_lines.drain(..) {
+                            let patched = if let Some(ref cache) = cache_result {
+                                patch_sse_line(&pending, cache)
+                            } else {
+                                format!("{}\n", pending)
+                            };
+                            if tx.send(Ok(Bytes::from(patched))).await.is_err() {
+                                return;
+                            }
+                        }
+                        // Patch current line too
+                        let output = if let Some(ref cache) = cache_result {
                             patch_sse_line(&line, cache)
                         } else {
                             format!("{}\n", line)
+                        };
+                        if tx.send(Ok(Bytes::from(output))).await.is_err() {
+                            return;
                         }
-                    } else if !upstream_has_cache {
-                        if let Some(ref cache) = cache_result_for_task {
-                            patch_sse_line(&line, cache)
-                        } else {
-                            format!("{}\n", line)
+                    } else if checked_upstream_cache && upstream_has_cache {
+                        // Upstream has cache — flush pending lines unpatched
+                        for pending in pending_lines.drain(..) {
+                            if tx
+                                .send(Ok(Bytes::from(format!("{}\n", pending))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
+                        if tx
+                            .send(Ok(Bytes::from(format!("{}\n", line))))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        // Not yet determined — buffer the line
+                        pending_lines.push(line);
+                    }
+                } else if !checked_upstream_cache {
+                    // Non-data line before determination — buffer it
+                    pending_lines.push(line);
+                } else if !upstream_has_cache {
+                    let output = if let Some(ref cache) = cache_result {
+                        patch_sse_line(&line, cache)
                     } else {
                         format!("{}\n", line)
                     };
-
-                if tx.send(Ok(Bytes::from(output_line))).await.is_err() {
-                    return;
+                    if tx.send(Ok(Bytes::from(output))).await.is_err() {
+                        return;
+                    }
+                } else {
+                    if tx
+                        .send(Ok(Bytes::from(format!("{}\n", line))))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -476,7 +567,7 @@ async fn handle_sse_streaming(
                 Some((
                     true,
                     plan.breakpoints.len(),
-                    cache_result_for_task.unwrap_or_default(),
+                    cache_result.unwrap_or_default(),
                     debug,
                 ))
             }
@@ -862,6 +953,81 @@ fn compute_cache_path(request: &Value) -> CachePath {
     }
 
     path
+}
+
+fn strip_cch_from_request_body(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Bytes {
+    if method != Method::POST || !matches!(path, "/v1/messages" | "/cc/v1/messages") {
+        return body;
+    }
+
+    if !is_json_request(headers) {
+        return body;
+    }
+
+    let Ok(mut request) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+
+    if !strip_cch_from_request(&mut request) {
+        return body;
+    }
+
+    match serde_json::to_vec(&request) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => body,
+    }
+}
+
+fn strip_cch_from_request(request: &mut Value) -> bool {
+    match request.get_mut("system") {
+        Some(Value::String(text)) => strip_cch_from_string(text),
+        Some(Value::Array(system_messages)) => {
+            let mut changed = false;
+            for message in system_messages {
+                if let Some(Value::String(text)) = message.get_mut("text") {
+                    changed |= strip_cch_from_string(text);
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn strip_cch_from_string(text: &mut String) -> bool {
+    if !text.contains("x-anthropic-billing-header") {
+        return false;
+    }
+    let stripped = strip_cch_segments(text);
+    if stripped == *text {
+        false
+    } else {
+        *text = stripped;
+        true
+    }
+}
+
+fn strip_cch_segments(text: &str) -> String {
+    let mut changed = false;
+    let segments = text
+        .split(';')
+        .filter(|segment| {
+            let is_cch = segment.trim_start().starts_with("cch=");
+            changed |= is_cch;
+            !is_cch
+        })
+        .collect::<Vec<_>>();
+
+    if changed {
+        segments.join(";")
+    } else {
+        text.to_string()
+    }
 }
 
 fn push_prefix(
@@ -1369,6 +1535,59 @@ mod tests {
     }
 
     #[test]
+    fn strip_cch_removes_dynamic_segment_from_forwarded_body_and_cache_hash() {
+        let headers = HeaderMap::new();
+        let first_body = claude_code_cch_request("dee71");
+        let second_body = claude_code_cch_request("460a0");
+
+        let first_stripped =
+            strip_cch_from_request_body(&Method::POST, "/v1/messages", &headers, first_body);
+        let second_stripped =
+            strip_cch_from_request_body(&Method::POST, "/v1/messages", &headers, second_body);
+        let value: Value = serde_json::from_slice(&first_stripped).expect("valid stripped JSON");
+
+        let system_text = value["system"][0]["text"]
+            .as_str()
+            .expect("system text exists");
+        assert!(system_text.contains("x-anthropic-billing-header"));
+        assert!(!system_text.contains("cch="));
+
+        let first_plan = compute_request_cache_plan(
+            &Method::POST,
+            "/v1/messages",
+            &headers,
+            &first_stripped,
+            "sk-test",
+        )
+        .expect("first plan should be prepared");
+        let second_plan = compute_request_cache_plan(
+            &Method::POST,
+            "/v1/messages",
+            &headers,
+            &second_stripped,
+            "sk-test",
+        )
+        .expect("second plan should be prepared");
+        let first_breakpoint = &first_plan.breakpoints[0];
+        let second_breakpoint = &second_plan.breakpoints[0];
+
+        assert_eq!(
+            first_plan.prefixes[first_breakpoint.prefix_index].hash,
+            second_plan.prefixes[second_breakpoint.prefix_index].hash
+        );
+    }
+
+    #[test]
+    fn strip_cch_is_scoped_to_claude_messages_json_requests() {
+        let headers = HeaderMap::new();
+        let body = claude_code_cch_request("abc12");
+        let stripped =
+            strip_cch_from_request_body(&Method::POST, "/v1/other", &headers, body.clone());
+
+        assert_eq!(stripped, body);
+    }
+
+    #[test]
     fn short_prompts_do_not_create_breakpoints_under_minimum() {
         let body = br#"{
             "model": "claude-sonnet-4-6",
@@ -1490,12 +1709,35 @@ mod tests {
             upstream: Some(" http://127.0.0.1:8080/ ".to_string()),
             host: Some("127.0.0.1".to_string()),
             port: Some(8991),
+            simulate_cache: false,
+            no_simulate_cache: false,
+            strip_cch: false,
+            no_strip_cch: false,
         })
         .expect("CLI config should load");
 
         assert_eq!(config.upstream, "http://127.0.0.1:8080");
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 8991);
+        assert!(config.simulate_cache);
+        assert!(config.strip_cch);
+    }
+
+    #[test]
+    fn feature_toggles_can_be_disabled_by_cli() {
+        let config = Config::load(Args {
+            upstream: Some("http://127.0.0.1:8080".to_string()),
+            host: None,
+            port: None,
+            simulate_cache: false,
+            no_simulate_cache: true,
+            strip_cch: false,
+            no_strip_cch: true,
+        })
+        .expect("CLI config should load");
+
+        assert!(!config.simulate_cache);
+        assert!(!config.strip_cch);
     }
 
     #[test]
@@ -1512,5 +1754,17 @@ mod tests {
 
     fn long_text() -> String {
         "cacheable prompt material ".repeat(240)
+    }
+
+    fn claude_code_cch_request(cch: &str) -> Bytes {
+        let request = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {"text": format!("x-anthropic-billing-header: cc_version=2.1.138.9e3; cc_entrypoint=sdk-cli; cch={cch};")},
+                {"text": long_text().repeat(4), "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        Bytes::from(serde_json::to_vec(&request).expect("request JSON should serialize"))
     }
 }
