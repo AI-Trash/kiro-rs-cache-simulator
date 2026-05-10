@@ -189,6 +189,7 @@ struct CacheDebugSummary {
     api_key_hash: String,
     prefix_count: usize,
     breakpoint_prefixes: String,
+    prefix_sample: String,
 }
 
 fn cache_debug_summary(
@@ -215,7 +216,26 @@ fn cache_debug_summary(
         api_key_hash: short_hash(&sha256_hex(api_key.as_bytes())),
         prefix_count: prefixes.len(),
         breakpoint_prefixes,
+        prefix_sample: prefix_sample(prefixes),
     }
+}
+
+fn prefix_sample(prefixes: &[CachePrefix]) -> String {
+    let prefix_count = prefixes.len();
+    let mut sampled = Vec::new();
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if prefix_count <= 24 || index < 12 || index + 12 >= prefix_count {
+            sampled.push(format!(
+                "{}:{}:{}",
+                index,
+                prefix.tokens,
+                short_hash(&prefix.hash)
+            ));
+        } else if sampled.last().is_none_or(|entry| entry != "...") {
+            sampled.push("...".to_string());
+        }
+    }
+    sampled.join(",")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -351,6 +371,7 @@ async fn proxy_inner(state: AppState, req: Request<Body>) -> Result<Response<Bod
                 api_key_hash = %debug_summary.api_key_hash,
                 prefix_count = debug_summary.prefix_count,
                 breakpoint_prefixes = %debug_summary.breakpoint_prefixes,
+                prefix_sample = %debug_summary.prefix_sample,
                 "cache calculation completed after proxy pass-through"
             );
         } else {
