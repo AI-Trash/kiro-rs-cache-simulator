@@ -9,10 +9,9 @@ use axum::{
 };
 use clap::Parser;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::TcpListener, sync::Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
@@ -26,33 +25,14 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 #[command(name = "kiro-rs-cache-simulator")]
 #[command(about = "Pure in-memory prompt-cache simulator for a running kiro-rs service")]
 struct Args {
-    #[arg(short, long, default_value = "cache-simulator.json")]
-    config: PathBuf,
-
     #[arg(long)]
     upstream: Option<String>,
-
-    #[arg(long, hide = true)]
-    source_url: Option<String>,
 
     #[arg(long)]
     host: Option<String>,
 
     #[arg(long)]
     port: Option<u16>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileConfig {
-    #[serde(default = "default_host")]
-    host: String,
-    #[serde(default = "default_port")]
-    port: u16,
-    #[serde(default)]
-    upstream: Option<String>,
-    #[serde(default)]
-    source_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,44 +53,27 @@ fn default_port() -> u16 {
 
 impl Config {
     fn load(args: Args) -> Result<Self> {
-        let mut file_config = if args.config.exists() {
-            let content = std::fs::read_to_string(&args.config)
-                .with_context(|| format!("failed to read config {}", args.config.display()))?;
-            serde_json::from_str::<FileConfig>(&content)
-                .with_context(|| format!("failed to parse config {}", args.config.display()))?
-        } else {
-            FileConfig {
-                host: default_host(),
-                port: default_port(),
-                upstream: None,
-                source_url: None,
-            }
+        let host = first_non_empty([args.host, env::var("HOST").ok()]).unwrap_or_else(default_host);
+        let port = match args.port {
+            Some(port) => port,
+            None => env::var("PORT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .trim()
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid PORT value {value:?}"))
+                })
+                .transpose()?
+                .unwrap_or_else(default_port),
         };
-
-        if let Some(host) = args.host {
-            file_config.host = host;
-        }
-        if let Some(port) = args.port {
-            file_config.port = port;
-        }
-
-        let upstream = first_non_empty([
-            args.upstream,
-            args.source_url,
-            env::var("UPSTREAM").ok(),
-            file_config.upstream,
-            file_config.source_url,
-        ])
-        .ok_or_else(|| {
-            anyhow!(
-                "upstream is required via UPSTREAM, --upstream, or {}",
-                args.config.display()
-            )
-        })?;
+        let upstream = first_non_empty([args.upstream, env::var("UPSTREAM").ok()])
+            .ok_or_else(|| anyhow!("upstream is required via --upstream or UPSTREAM"))?;
 
         Ok(Config {
-            host: file_config.host,
-            port: file_config.port,
+            host,
+            port,
             upstream: upstream.trim_end_matches('/').to_string(),
             debug_cache_keys: env_flag("CACHE_SIMULATOR_DEBUG_KEYS"),
         })
@@ -1522,18 +1485,17 @@ mod tests {
     }
 
     #[test]
-    fn file_config_accepts_upstream_and_legacy_source_url() {
-        let modern: FileConfig = serde_json::from_value(json!({
-            "upstream": "http://127.0.0.1:8080"
-        }))
-        .expect("modern config should parse");
-        assert_eq!(modern.upstream.as_deref(), Some("http://127.0.0.1:8080"));
+    fn config_loads_cli_values_without_config_file() {
+        let config = Config::load(Args {
+            upstream: Some(" http://127.0.0.1:8080/ ".to_string()),
+            host: Some("127.0.0.1".to_string()),
+            port: Some(8991),
+        })
+        .expect("CLI config should load");
 
-        let legacy: FileConfig = serde_json::from_value(json!({
-            "sourceUrl": "http://127.0.0.1:8081"
-        }))
-        .expect("legacy config should parse");
-        assert_eq!(legacy.source_url.as_deref(), Some("http://127.0.0.1:8081"));
+        assert_eq!(config.upstream, "http://127.0.0.1:8080");
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 8991);
     }
 
     #[test]
