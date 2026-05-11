@@ -237,10 +237,10 @@ async fn handle_sse_streaming(
             commit_prepared_cache_update(&state_for_task.cache, &plan_for_log.api_key, &prepared)
                 .await;
             let result = preview;
-            send_deferred_sse_lines(&tx, streamed.deferred_lines, Some(&result)).await;
+            send_deferred_sse_events(&tx, streamed.deferred_events, Some(&result)).await;
             cache_result = Some(result);
         } else {
-            send_deferred_sse_lines(&tx, streamed.deferred_lines, None).await;
+            send_deferred_sse_events(&tx, streamed.deferred_events, None).await;
         }
 
         let cache_log = match cache_result {
@@ -301,7 +301,12 @@ struct StreamedSseState {
     is_complete: bool,
     upstream_has_cache: bool,
     has_patch_target: bool,
-    deferred_lines: Vec<PendingSseLine>,
+    defer_remaining_events: bool,
+    deferred_events: Vec<PendingSseEvent>,
+}
+
+struct PendingSseEvent {
+    lines: Vec<PendingSseLine>,
 }
 
 async fn stream_sse_with_deferred_cache(
@@ -311,11 +316,13 @@ async fn stream_sse_with_deferred_cache(
 ) -> StreamedSseState {
     let mut byte_stream = upstream.bytes_stream();
     let mut byte_buffer: Vec<u8> = Vec::new();
+    let mut event_lines = Vec::new();
     let mut state = StreamedSseState {
         is_complete: true,
         upstream_has_cache: false,
         has_patch_target: false,
-        deferred_lines: Vec::new(),
+        defer_remaining_events: false,
+        deferred_events: Vec::new(),
     };
 
     while let Some(chunk_result) = byte_stream.next().await {
@@ -333,7 +340,18 @@ async fn stream_sse_with_deferred_cache(
             let line_bytes = byte_buffer[..newline_pos].to_vec();
             byte_buffer = byte_buffer[newline_pos + 1..].to_vec();
             let line = String::from_utf8_lossy(&line_bytes).into_owned();
-            if !handle_sse_line_for_streaming(tx, &mut state, line, true, cache_preview).await {
+            event_lines.push(PendingSseLine {
+                line: line.clone(),
+                had_newline: true,
+            });
+            if !line.trim_end_matches('\r').is_empty() {
+                continue;
+            }
+
+            let event = PendingSseEvent {
+                lines: std::mem::take(&mut event_lines),
+            };
+            if !handle_sse_event_for_streaming(tx, &mut state, event, cache_preview).await {
                 state.is_complete = false;
                 return state;
             }
@@ -342,7 +360,15 @@ async fn stream_sse_with_deferred_cache(
 
     if !byte_buffer.is_empty() && state.is_complete {
         let line = String::from_utf8_lossy(&byte_buffer).into_owned();
-        if !handle_sse_line_for_streaming(tx, &mut state, line, false, cache_preview).await {
+        event_lines.push(PendingSseLine {
+            line,
+            had_newline: false,
+        });
+    }
+
+    if !event_lines.is_empty() && state.is_complete {
+        let event = PendingSseEvent { lines: event_lines };
+        if !handle_sse_event_for_streaming(tx, &mut state, event, cache_preview).await {
             state.is_complete = false;
         }
     }
@@ -350,59 +376,84 @@ async fn stream_sse_with_deferred_cache(
     state
 }
 
-async fn handle_sse_line_for_streaming(
+async fn handle_sse_event_for_streaming(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     state: &mut StreamedSseState,
-    line: String,
-    had_newline: bool,
+    event: PendingSseEvent,
     cache_preview: &CacheResult,
 ) -> bool {
     if state.upstream_has_cache {
-        return send_sse_line(tx, PendingSseLine { line, had_newline }).await;
+        return send_sse_event(tx, event).await;
     }
 
-    if sse_line_has_cache_usage_fields(&line) {
+    if sse_event_has_cache_usage_fields(&event) {
         state.upstream_has_cache = true;
-        if !send_deferred_sse_lines(tx, std::mem::take(&mut state.deferred_lines), None).await {
+        if !send_deferred_sse_events(tx, std::mem::take(&mut state.deferred_events), None).await {
             return false;
         }
-        return send_sse_line(tx, PendingSseLine { line, had_newline }).await;
+        return send_sse_event(tx, event).await;
     }
 
-    if sse_line_is_patchable_start_usage(&line) {
-        state.has_patch_target = true;
-        return send_patched_sse_line(tx, PendingSseLine { line, had_newline }, cache_preview)
-            .await;
-    }
-
-    if sse_line_is_patchable_final_usage(&line) {
-        state.has_patch_target = true;
-        state
-            .deferred_lines
-            .push(PendingSseLine { line, had_newline });
+    if state.defer_remaining_events {
+        state.deferred_events.push(event);
         return true;
     }
 
-    if sse_line_is_done(&line) {
-        state
-            .deferred_lines
-            .push(PendingSseLine { line, had_newline });
+    if sse_event_is_patchable_start_usage(&event) {
+        state.has_patch_target = true;
+        return send_patched_sse_event(tx, event, cache_preview).await;
+    }
+
+    if sse_event_is_patchable_final_usage(&event) {
+        state.has_patch_target = true;
+        state.defer_remaining_events = true;
+        state.deferred_events.push(event);
         return true;
     }
 
-    send_sse_line(tx, PendingSseLine { line, had_newline }).await
+    if sse_event_is_done(&event) {
+        state.deferred_events.push(event);
+        return true;
+    }
+
+    send_sse_event(tx, event).await
 }
 
-async fn send_deferred_sse_lines(
+fn sse_event_has_cache_usage_fields(event: &PendingSseEvent) -> bool {
+    event
+        .lines
+        .iter()
+        .any(|line| sse_line_has_cache_usage_fields(&line.line))
+}
+
+fn sse_event_is_patchable_start_usage(event: &PendingSseEvent) -> bool {
+    event
+        .lines
+        .iter()
+        .any(|line| sse_line_is_patchable_start_usage(&line.line))
+}
+
+fn sse_event_is_patchable_final_usage(event: &PendingSseEvent) -> bool {
+    event
+        .lines
+        .iter()
+        .any(|line| sse_line_is_patchable_final_usage(&line.line))
+}
+
+fn sse_event_is_done(event: &PendingSseEvent) -> bool {
+    event.lines.iter().any(|line| sse_line_is_done(&line.line))
+}
+
+async fn send_deferred_sse_events(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    lines: Vec<PendingSseLine>,
+    events: Vec<PendingSseEvent>,
     cache: Option<&CacheResult>,
 ) -> bool {
-    for line in lines {
+    for event in events {
         let bytes = if let Some(cache) = cache {
-            patched_sse_line_bytes(&line, cache)
+            patched_sse_event_bytes(&event, cache)
         } else {
-            sse_line_bytes(&line)
+            sse_event_bytes(&event)
         };
         if tx.send(Ok(bytes)).await.is_err() {
             return false;
@@ -411,22 +462,72 @@ async fn send_deferred_sse_lines(
     true
 }
 
-async fn send_sse_line(
+async fn send_sse_event(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    line: PendingSseLine,
+    event: PendingSseEvent,
 ) -> bool {
-    tx.send(Ok(sse_line_bytes(&line))).await.is_ok()
+    tx.send(Ok(sse_event_bytes(&event))).await.is_ok()
 }
 
-async fn send_patched_sse_line(
+async fn send_patched_sse_event(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    line: PendingSseLine,
+    event: PendingSseEvent,
     cache: &CacheResult,
 ) -> bool {
-    tx.send(Ok(patched_sse_line_bytes(&line, cache)))
+    tx.send(Ok(patched_sse_event_bytes(&event, cache)))
         .await
         .is_ok()
 }
+
+fn sse_event_bytes(event: &PendingSseEvent) -> Bytes {
+    Bytes::from(
+        event
+            .lines
+            .iter()
+            .flat_map(|line| sse_line_bytes(line).to_vec())
+            .collect::<Vec<u8>>(),
+    )
+}
+
+fn patched_sse_event_bytes(event: &PendingSseEvent, cache: &CacheResult) -> Bytes {
+    Bytes::from(
+        event
+            .lines
+            .iter()
+            .flat_map(|line| {
+                if sse_line_is_patchable_start_usage(&line.line)
+                    || sse_line_is_patchable_final_usage(&line.line)
+                {
+                    patched_sse_line_bytes(line, cache).to_vec()
+                } else {
+                    sse_line_bytes(line).to_vec()
+                }
+            })
+            .collect::<Vec<u8>>(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn patch_sse_event_text_for_test(event_text: &str, cache: &CacheResult) -> String {
+    let mut lines = Vec::new();
+    for segment in event_text.split_inclusive('\n') {
+        let had_newline = segment.ends_with('\n');
+        let line = segment.strip_suffix('\n').unwrap_or(segment).to_string();
+        lines.push(PendingSseLine { line, had_newline });
+    }
+
+    if !event_text.ends_with('\n') && lines.is_empty() {
+        lines.push(PendingSseLine {
+            line: event_text.to_string(),
+            had_newline: false,
+        });
+    }
+
+    let patched = patched_sse_event_bytes(&PendingSseEvent { lines }, cache);
+    String::from_utf8(patched.to_vec()).expect("patched SSE event should be UTF-8")
+}
+
+
 
 fn sse_line_bytes(line: &PendingSseLine) -> Bytes {
     if line.had_newline {

@@ -4,7 +4,7 @@ use crate::cache::{
 };
 use crate::cch::strip_cch_from_request_body;
 use crate::config::{Args, Config, first_non_empty};
-use crate::proxy::should_apply_deferred_sse_cache;
+use crate::proxy::{patch_sse_event_text_for_test, should_apply_deferred_sse_cache};
 use crate::response_patch::{
     extract_sse_data, inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
     sse_line_has_cache_usage_fields, sse_line_is_patchable_final_usage,
@@ -592,6 +592,27 @@ fn sse_line_patching_handles_final_line_without_newline() {
     assert!(!patched.ends_with('\n'));
     assert!(patched.contains("\"cache_read_input_tokens\":7"));
     assert!(patched.contains("\"input_tokens\":5"));
+}
+
+#[test]
+fn sse_event_patching_preserves_event_and_data_frame_together() {
+    let event = concat!(
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n",
+        "\n",
+    );
+    let cache = CacheResult {
+        cache_read_input_tokens: 7,
+        cache_creation_input_tokens: 0,
+        uncached_input_tokens: 5,
+    };
+
+    let patched = patch_sse_event_text_for_test(event, &cache);
+
+    assert!(patched.starts_with("event: message_delta\ndata: "));
+    assert!(patched.ends_with("\n\n"));
+    assert!(patched.contains("\"output_tokens\":6"));
+    assert!(patched.contains("\"cache_read_input_tokens\":7"));
 }
 
 #[test]
