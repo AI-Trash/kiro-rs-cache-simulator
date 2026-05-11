@@ -4,11 +4,11 @@ use crate::cache::{
     prepare_cache_update,
 };
 use crate::cch::strip_cch_from_request_body;
-use crate::response_patch::{inject_json_cache_fields, response_has_cache_usage_fields};
-use crate::sse::{
-    passthrough_sse, send_deferred_sse_events, should_apply_deferred_sse_cache,
-    stream_sse_with_deferred_cache,
+use crate::response_patch::{
+    inject_json_cache_fields, json_usage_total_input_tokens, normalize_cache_result,
+    response_has_cache_usage_fields,
 };
+use crate::sse::{passthrough_sse, should_commit_streamed_sse_cache, stream_sse_with_cache_patch};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -132,7 +132,10 @@ async fn handle_buffered(
                 plan.total_input_tokens,
             )
             .await;
-            cache_log = Some((true, plan.breakpoints.len(), result.clone(), debug));
+            let log_result = json_usage_total_input_tokens(&response_body)
+                .map(|total_input_tokens| normalize_cache_result(&result, total_input_tokens))
+                .unwrap_or_else(|| result.clone());
+            cache_log = Some((true, plan.breakpoints.len(), log_result, debug));
             Some(result)
         }
         Some(plan) => {
@@ -206,8 +209,8 @@ async fn handle_sse_streaming(
         .await;
         let preview = prepared.result.clone();
         let mut cache_result: Option<CacheResult> = None;
-        let streamed = stream_sse_with_deferred_cache(upstream, &tx, &preview).await;
-        let should_apply_cache = should_apply_deferred_sse_cache(
+        let streamed = stream_sse_with_cache_patch(upstream, &tx, &preview).await;
+        let should_apply_cache = should_commit_streamed_sse_cache(
             streamed.is_complete,
             !tx.is_closed(),
             streamed.upstream_has_cache,
@@ -217,11 +220,11 @@ async fn handle_sse_streaming(
         if should_apply_cache {
             commit_prepared_cache_update(&state_for_task.cache, &plan_for_log.api_key, &prepared)
                 .await;
-            let result = preview;
-            send_deferred_sse_events(&tx, streamed.deferred_events, Some(&result)).await;
+            let result = streamed
+                .upstream_total_input_tokens
+                .map(|total_input_tokens| normalize_cache_result(&preview, total_input_tokens))
+                .unwrap_or(preview);
             cache_result = Some(result);
-        } else {
-            send_deferred_sse_events(&tx, streamed.deferred_events, None).await;
         }
 
         let debug = make_debug(&state_for_task, &plan_for_log);

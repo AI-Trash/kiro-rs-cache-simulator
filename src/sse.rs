@@ -2,6 +2,7 @@ use crate::cache::CacheResult;
 use crate::response_patch::{
     patch_sse_line, sse_line_has_cache_usage_fields, sse_line_is_done,
     sse_line_is_patchable_final_usage, sse_line_is_patchable_start_usage,
+    sse_line_usage_total_input_tokens,
 };
 use axum::body::Bytes;
 use futures_util::StreamExt;
@@ -19,11 +20,10 @@ pub(crate) struct StreamedSseState {
     pub(crate) is_complete: bool,
     pub(crate) upstream_has_cache: bool,
     pub(crate) has_patch_target: bool,
-    pub(crate) defer_remaining_events: bool,
-    pub(crate) deferred_events: Vec<PendingSseEvent>,
+    pub(crate) upstream_total_input_tokens: Option<i32>,
 }
 
-pub(crate) async fn stream_sse_with_deferred_cache(
+pub(crate) async fn stream_sse_with_cache_patch(
     upstream: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     cache_preview: &CacheResult,
@@ -35,8 +35,7 @@ pub(crate) async fn stream_sse_with_deferred_cache(
         is_complete: true,
         upstream_has_cache: false,
         has_patch_target: false,
-        defer_remaining_events: false,
-        deferred_events: Vec::new(),
+        upstream_total_input_tokens: None,
     };
 
     while let Some(chunk_result) = byte_stream.next().await {
@@ -102,32 +101,27 @@ async fn handle_sse_event_for_streaming(
 
     if sse_event_has_cache_usage_fields(&event) {
         state.upstream_has_cache = true;
-        if !send_deferred_sse_events(tx, std::mem::take(&mut state.deferred_events), None).await {
-            return false;
-        }
         return send_sse_event(tx, event).await;
-    }
-
-    if state.defer_remaining_events {
-        state.deferred_events.push(event);
-        return true;
     }
 
     if sse_event_is_patchable_start_usage(&event) {
         state.has_patch_target = true;
+        if let Some(total_input_tokens) = sse_event_usage_total_input_tokens(&event) {
+            state.upstream_total_input_tokens = Some(total_input_tokens);
+        }
         return send_patched_sse_event(tx, event, cache_preview).await;
     }
 
     if sse_event_is_patchable_final_usage(&event) {
         state.has_patch_target = true;
-        state.defer_remaining_events = true;
-        state.deferred_events.push(event);
-        return true;
+        if let Some(total_input_tokens) = sse_event_usage_total_input_tokens(&event) {
+            state.upstream_total_input_tokens = Some(total_input_tokens);
+        }
+        return send_patched_sse_event(tx, event, cache_preview).await;
     }
 
     if sse_event_is_done(&event) {
-        state.deferred_events.push(event);
-        return true;
+        return send_sse_event(tx, event).await;
     }
 
     send_sse_event(tx, event).await
@@ -158,22 +152,11 @@ fn sse_event_is_done(event: &PendingSseEvent) -> bool {
     event.lines.iter().any(|line| sse_line_is_done(&line.line))
 }
 
-pub(crate) async fn send_deferred_sse_events(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    events: Vec<PendingSseEvent>,
-    cache: Option<&CacheResult>,
-) -> bool {
-    for event in events {
-        let bytes = if let Some(cache) = cache {
-            patched_sse_event_bytes(&event, cache)
-        } else {
-            sse_event_bytes(&event)
-        };
-        if tx.send(Ok(bytes)).await.is_err() {
-            return false;
-        }
-    }
-    true
+fn sse_event_usage_total_input_tokens(event: &PendingSseEvent) -> Option<i32> {
+    event
+        .lines
+        .iter()
+        .find_map(|line| sse_line_usage_total_input_tokens(&line.line))
 }
 
 async fn send_sse_event(
@@ -252,7 +235,7 @@ pub(crate) async fn passthrough_sse(
     }
 }
 
-pub(crate) fn should_apply_deferred_sse_cache(
+pub(crate) fn should_commit_streamed_sse_cache(
     is_complete: bool,
     downstream_open: bool,
     upstream_has_cache: bool,

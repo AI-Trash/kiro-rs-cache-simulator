@@ -6,11 +6,11 @@ use crate::cache_plan::{compute_cache_path, count_all_tokens};
 use crate::cch::strip_cch_from_request_body;
 use crate::config::{Args, Config, first_non_empty};
 use crate::response_patch::{
-    extract_sse_data, inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
-    sse_line_has_cache_usage_fields, sse_line_is_patchable_final_usage,
-    sse_line_is_patchable_start_usage,
+    extract_sse_data, inject_json_cache_fields, normalize_cache_result, patch_sse_line,
+    response_has_cache_usage_fields, sse_line_has_cache_usage_fields,
+    sse_line_is_patchable_final_usage, sse_line_is_patchable_start_usage,
 };
-use crate::sse::{patch_sse_event_text_for_test, should_apply_deferred_sse_cache};
+use crate::sse::{patch_sse_event_text_for_test, should_commit_streamed_sse_cache};
 use axum::body::Bytes;
 use http::{HeaderMap, Method, header};
 use serde_json::{Value, json};
@@ -498,6 +498,7 @@ fn mythos_preview_uses_4096_token_cache_minimum() {
 
 #[test]
 fn injects_json_usage_cache_fields() {
+    let upstream_total_input_tokens = 123;
     let body = Bytes::from_static(br#"{"usage":{"input_tokens":123,"output_tokens":2}}"#);
     let cache = CacheResult {
         cache_read_input_tokens: 3,
@@ -507,9 +508,31 @@ fn injects_json_usage_cache_fields() {
 
     let patched = inject_json_cache_fields(body, &cache);
     let value: Value = serde_json::from_slice(&patched).expect("valid patched JSON");
-    assert_eq!(value["usage"]["cache_read_input_tokens"], 3);
-    assert_eq!(value["usage"]["cache_creation_input_tokens"], 4);
-    assert_eq!(value["usage"]["input_tokens"], 123 - 3 - 4);
+    assert_eq!(value["usage"]["cache_read_input_tokens"], 31);
+    assert_eq!(value["usage"]["cache_creation_input_tokens"], 41);
+    assert_eq!(value["usage"]["input_tokens"], 51);
+    assert_eq!(usage_total(&value["usage"]), upstream_total_input_tokens);
+}
+
+#[test]
+fn normalizes_cache_fields_to_upstream_input_token_total() {
+    let cache = CacheResult {
+        cache_read_input_tokens: 75_000,
+        cache_creation_input_tokens: 500,
+        uncached_input_tokens: 2_500,
+    };
+    let upstream_total_input_tokens = 4_000;
+
+    let normalized = normalize_cache_result(&cache, upstream_total_input_tokens);
+
+    assert!(normalized.cache_read_input_tokens < cache.cache_read_input_tokens);
+    assert!(normalized.cache_creation_input_tokens > 0);
+    assert_eq!(
+        normalized.cache_read_input_tokens
+            + normalized.cache_creation_input_tokens
+            + normalized.uncached_input_tokens,
+        upstream_total_input_tokens
+    );
 }
 
 #[test]
@@ -532,6 +555,7 @@ fn leaves_json_usage_unchanged_when_upstream_already_has_cache_fields() {
 
 #[test]
 fn injects_sse_message_start_usage_cache_fields() {
+    let upstream_total_input_tokens = 100;
     let line = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}";
     let cache = CacheResult {
         cache_read_input_tokens: 7,
@@ -541,9 +565,15 @@ fn injects_sse_message_start_usage_cache_fields() {
 
     let patched = patch_sse_line(line, &cache);
     assert!(sse_line_is_patchable_start_usage(line));
-    assert!(patched.contains("\"cache_read_input_tokens\":7"));
-    assert!(patched.contains("\"cache_creation_input_tokens\":3"));
-    assert!(patched.contains("\"input_tokens\":90"));
+    assert!(patched.contains("\"cache_read_input_tokens\":64"));
+    assert!(patched.contains("\"cache_creation_input_tokens\":27"));
+    assert!(patched.contains("\"input_tokens\":9"));
+    let data = extract_sse_data(patched.trim_end()).expect("patched SSE data");
+    let value: Value = serde_json::from_str(data).expect("valid patched SSE JSON");
+    assert_eq!(
+        usage_total(&value["message"]["usage"]),
+        upstream_total_input_tokens
+    );
 }
 
 #[test]
@@ -561,9 +591,9 @@ fn sse_data_parsing_accepts_missing_space_after_colon() {
     );
 
     let patched = patch_sse_line(line, &cache);
-    assert!(patched.contains("\"cache_read_input_tokens\":7"));
-    assert!(patched.contains("\"cache_creation_input_tokens\":3"));
-    assert!(patched.contains("\"input_tokens\":10"));
+    assert!(patched.contains("\"cache_read_input_tokens\":13"));
+    assert!(patched.contains("\"cache_creation_input_tokens\":5"));
+    assert!(patched.contains("\"input_tokens\":2"));
 }
 
 #[test]
@@ -574,6 +604,19 @@ fn sse_line_detection_finds_late_upstream_cache_fields() {
 
     assert!(!sse_line_has_cache_usage_fields(early_usage));
     assert!(sse_line_has_cache_usage_fields(late_upstream_cache));
+}
+
+#[test]
+fn output_only_sse_delta_usage_is_not_cache_patch_target() {
+    let line = "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}";
+    let cache = CacheResult {
+        cache_read_input_tokens: 7,
+        cache_creation_input_tokens: 3,
+        uncached_input_tokens: 5,
+    };
+
+    assert!(!sse_line_is_patchable_final_usage(line));
+    assert_eq!(patch_sse_line(line, &cache), format!("{}\n", line));
 }
 
 #[test]
@@ -615,17 +658,17 @@ fn sse_event_patching_preserves_event_and_data_frame_together() {
     assert!(patched.starts_with("event: message_delta\ndata: "));
     assert!(patched.ends_with("\n\n"));
     assert!(patched.contains("\"output_tokens\":6"));
-    assert!(patched.contains("\"cache_read_input_tokens\":7"));
-    assert!(patched.contains("\"input_tokens\":10"));
+    assert!(patched.contains("\"cache_read_input_tokens\":9"));
+    assert!(patched.contains("\"input_tokens\":7"));
 }
 
 #[test]
-fn deferred_sse_cache_applies_only_for_complete_open_streams_with_patch_target() {
-    assert!(should_apply_deferred_sse_cache(true, true, false, true));
-    assert!(!should_apply_deferred_sse_cache(false, true, false, true));
-    assert!(!should_apply_deferred_sse_cache(true, false, false, true));
-    assert!(!should_apply_deferred_sse_cache(true, true, true, true));
-    assert!(!should_apply_deferred_sse_cache(true, true, false, false));
+fn streamed_sse_cache_commits_only_for_complete_open_streams_with_patch_target() {
+    assert!(should_commit_streamed_sse_cache(true, true, false, true));
+    assert!(!should_commit_streamed_sse_cache(false, true, false, true));
+    assert!(!should_commit_streamed_sse_cache(true, false, false, true));
+    assert!(!should_commit_streamed_sse_cache(true, true, true, true));
+    assert!(!should_commit_streamed_sse_cache(true, true, false, false));
 }
 
 #[test]
@@ -742,4 +785,14 @@ fn claude_code_cch_request(cch: &str) -> Bytes {
         "messages": [{"role": "user", "content": "hello"}]
     });
     Bytes::from(serde_json::to_vec(&request).expect("request JSON should serialize"))
+}
+
+fn usage_total(usage: &Value) -> i64 {
+    usage["input_tokens"].as_i64().unwrap_or_default()
+        + usage["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or_default()
+        + usage["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or_default()
 }

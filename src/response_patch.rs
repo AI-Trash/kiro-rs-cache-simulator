@@ -2,6 +2,51 @@ use crate::cache::CacheResult;
 use axum::body::Bytes;
 use serde_json::{Map, Value};
 
+/// Treat upstream `usage.input_tokens` as the total input token count when the
+/// upstream response has no cache usage fields, then split that total into the
+/// simulator's uncached/read/creation proportions.
+pub(crate) fn normalize_cache_result(
+    cache: &CacheResult,
+    upstream_total_input_tokens: i32,
+) -> CacheResult {
+    let upstream_total = upstream_total_input_tokens.max(0);
+    let estimated_read = cache.cache_read_input_tokens.max(0);
+    let estimated_creation = cache.cache_creation_input_tokens.max(0);
+    let estimated_uncached = cache.uncached_input_tokens.max(0);
+    let estimated_cached = estimated_read + estimated_creation;
+    let estimated_total = estimated_cached + estimated_uncached;
+
+    if upstream_total == 0 || estimated_cached == 0 || estimated_total == 0 {
+        return CacheResult {
+            uncached_input_tokens: upstream_total,
+            ..CacheResult::default()
+        };
+    }
+
+    let normalized_cached =
+        proportional_round(upstream_total, estimated_cached, estimated_total).min(upstream_total);
+    let normalized_read = if estimated_read == 0 {
+        0
+    } else if estimated_creation == 0 {
+        normalized_cached
+    } else {
+        proportional_round(normalized_cached, estimated_read, estimated_cached)
+    };
+    let normalized_creation = (normalized_cached - normalized_read).max(0);
+
+    CacheResult {
+        cache_read_input_tokens: normalized_read,
+        cache_creation_input_tokens: normalized_creation,
+        uncached_input_tokens: (upstream_total - normalized_cached).max(0),
+    }
+}
+
+pub(crate) fn json_usage_total_input_tokens(body: &Bytes) -> Option<i32> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let usage = value.get("usage")?.as_object()?;
+    total_input_tokens_from_usage(usage)
+}
+
 pub(crate) fn inject_json_cache_fields(body: Bytes, cache: &CacheResult) -> Bytes {
     if json_body_has_cache_usage_fields(&body) {
         return body;
@@ -57,6 +102,15 @@ pub(crate) fn sse_line_is_patchable_start_usage(line: &str) -> bool {
     sse_line_is_patchable_usage_of_type(line, "message_start")
 }
 
+pub(crate) fn sse_line_usage_total_input_tokens(line: &str) -> Option<i32> {
+    let data = extract_sse_data(line)?;
+    if data == "[DONE]" {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(data).ok()?;
+    event_usage(&event).and_then(total_input_tokens_from_usage)
+}
+
 fn sse_line_is_patchable_usage_of_type(line: &str, event_type: &str) -> bool {
     let Some(data) = extract_sse_data(line) else {
         return false;
@@ -67,7 +121,9 @@ fn sse_line_is_patchable_usage_of_type(line: &str, event_type: &str) -> bool {
     serde_json::from_str::<Value>(data)
         .map(|event| {
             event.get("type").and_then(Value::as_str) == Some(event_type)
-                && event_usage(&event).is_some()
+                && event_usage(&event)
+                    .and_then(total_input_tokens_from_usage)
+                    .is_some()
                 && !json_has_cache_usage_fields(&event)
         })
         .unwrap_or(false)
@@ -175,23 +231,37 @@ fn patch_usage(usage: &mut Map<String, Value>, cache: &CacheResult) {
         return;
     }
 
-    let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
-
-    // Use the real input_tokens from Anthropic (which is the true total when upstream
-    // has no cache) and subtract our simulated cached portion to get uncached.
-    let original_input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0) as i32;
-    let uncached = (original_input_tokens - cached_tokens).max(0);
+    let Some(upstream_total_input_tokens) = total_input_tokens_from_usage(usage) else {
+        return;
+    };
+    let normalized = normalize_cache_result(cache, upstream_total_input_tokens);
 
     usage.insert(
         "cache_creation_input_tokens".to_string(),
-        Value::from(cache.cache_creation_input_tokens),
+        Value::from(normalized.cache_creation_input_tokens),
     );
     usage.insert(
         "cache_read_input_tokens".to_string(),
-        Value::from(cache.cache_read_input_tokens),
+        Value::from(normalized.cache_read_input_tokens),
     );
-    usage.insert("input_tokens".to_string(), Value::from(uncached));
+    usage.insert(
+        "input_tokens".to_string(),
+        Value::from(normalized.uncached_input_tokens),
+    );
+}
+
+fn total_input_tokens_from_usage(usage: &Map<String, Value>) -> Option<i32> {
+    let value = usage.get("input_tokens")?.as_i64()?;
+    i32::try_from(value).ok().map(|tokens| tokens.max(0))
+}
+
+fn proportional_round(total: i32, part: i32, denominator: i32) -> i32 {
+    if total <= 0 || part <= 0 || denominator <= 0 {
+        return 0;
+    }
+    let total = i64::from(total);
+    let part = i64::from(part);
+    let denominator = i64::from(denominator);
+    let rounded = (total * part + denominator / 2) / denominator;
+    i32::try_from(rounded).unwrap_or(i32::MAX)
 }
