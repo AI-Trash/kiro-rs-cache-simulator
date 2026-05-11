@@ -175,6 +175,16 @@ fn patch_usage(usage: &mut Map<String, Value>, cache: &CacheResult) {
         return;
     }
 
+    let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
+
+    // Use the real input_tokens from Anthropic (which is the true total when upstream
+    // has no cache) and subtract our simulated cached portion to get uncached.
+    let original_input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as i32;
+    let uncached = (original_input_tokens - cached_tokens).max(0);
+
     usage.insert(
         "cache_creation_input_tokens".to_string(),
         Value::from(cache.cache_creation_input_tokens),
@@ -183,9 +193,5 @@ fn patch_usage(usage: &mut Map<String, Value>, cache: &CacheResult) {
         "cache_read_input_tokens".to_string(),
         Value::from(cache.cache_read_input_tokens),
     );
-
-    usage.insert(
-        "input_tokens".to_string(),
-        Value::from(cache.uncached_input_tokens),
-    );
+    usage.insert("input_tokens".to_string(), Value::from(uncached));
 }

@@ -4,10 +4,10 @@ use crate::cache::{
     prepare_cache_update,
 };
 use crate::cch::strip_cch_from_request_body;
-use crate::response_patch::{
-    inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
-    sse_line_has_cache_usage_fields, sse_line_is_done, sse_line_is_patchable_final_usage,
-    sse_line_is_patchable_start_usage,
+use crate::response_patch::{inject_json_cache_fields, response_has_cache_usage_fields};
+use crate::sse::{
+    passthrough_sse, send_deferred_sse_events, should_apply_deferred_sse_cache,
+    stream_sse_with_deferred_cache,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -16,7 +16,6 @@ use axum::{
     http::{HeaderMap, Method, Request, Response, StatusCode, header},
     response::IntoResponse,
 };
-use futures_util::StreamExt;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -124,10 +123,7 @@ async fn handle_buffered(
     let mut cache_log = None;
     let cache_result = match cache_plan {
         Some(plan) if status.is_success() && !upstream_has_cache_usage => {
-            let breakpoint_count = plan.breakpoints.len();
-            let debug = state
-                .debug_cache_keys
-                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+            let debug = make_debug(&state, &plan);
             let result = lookup_or_create(
                 &state.cache,
                 &plan.api_key,
@@ -136,20 +132,11 @@ async fn handle_buffered(
                 plan.total_input_tokens,
             )
             .await;
-            cache_log = Some((true, breakpoint_count, result.clone(), debug));
+            cache_log = Some((true, plan.breakpoints.len(), result.clone(), debug));
             Some(result)
         }
-        Some(plan) if upstream_has_cache_usage => {
-            let debug = state
-                .debug_cache_keys
-                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
-            cache_log = Some((false, plan.breakpoints.len(), CacheResult::default(), debug));
-            None
-        }
         Some(plan) => {
-            let debug = state
-                .debug_cache_keys
-                .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints));
+            let debug = make_debug(&state, &plan);
             cache_log = Some((false, plan.breakpoints.len(), CacheResult::default(), debug));
             None
         }
@@ -192,13 +179,7 @@ async fn handle_sse_streaming(
     if !status.is_success() {
         tokio::spawn(async move {
             passthrough_sse(upstream, tx).await;
-            let debug = state_for_task.debug_cache_keys.then(|| {
-                cache_debug_summary(
-                    &plan_for_log.api_key,
-                    &plan_for_log.prefixes,
-                    &plan_for_log.breakpoints,
-                )
-            });
+            let debug = make_debug(&state_for_task, &plan_for_log);
             emit_cache_log(
                 &method_for_task,
                 &path_for_task,
@@ -243,47 +224,15 @@ async fn handle_sse_streaming(
             send_deferred_sse_events(&tx, streamed.deferred_events, None).await;
         }
 
+        let debug = make_debug(&state_for_task, &plan_for_log);
         let cache_log = match cache_result {
-            Some(result) => {
-                let debug = state_for_task.debug_cache_keys.then(|| {
-                    cache_debug_summary(
-                        &plan_for_log.api_key,
-                        &plan_for_log.prefixes,
-                        &plan_for_log.breakpoints,
-                    )
-                });
-                Some((true, plan_for_log.breakpoints.len(), result, debug))
-            }
-            None if streamed.upstream_has_cache => {
-                let debug = state_for_task.debug_cache_keys.then(|| {
-                    cache_debug_summary(
-                        &plan_for_log.api_key,
-                        &plan_for_log.prefixes,
-                        &plan_for_log.breakpoints,
-                    )
-                });
-                Some((
-                    false,
-                    plan_for_log.breakpoints.len(),
-                    CacheResult::default(),
-                    debug,
-                ))
-            }
-            None => {
-                let debug = state_for_task.debug_cache_keys.then(|| {
-                    cache_debug_summary(
-                        &plan_for_log.api_key,
-                        &plan_for_log.prefixes,
-                        &plan_for_log.breakpoints,
-                    )
-                });
-                Some((
-                    false,
-                    plan_for_log.breakpoints.len(),
-                    CacheResult::default(),
-                    debug,
-                ))
-            }
+            Some(result) => Some((true, plan_for_log.breakpoints.len(), result, debug)),
+            None => Some((
+                false,
+                plan_for_log.breakpoints.len(),
+                CacheResult::default(),
+                debug,
+            )),
         };
 
         emit_cache_log(&method_for_task, &path_for_task, status.as_u16(), cache_log);
@@ -292,281 +241,10 @@ async fn handle_sse_streaming(
     build_response(status, &response_headers, stream_body)
 }
 
-struct PendingSseLine {
-    line: String,
-    had_newline: bool,
-}
-
-struct StreamedSseState {
-    is_complete: bool,
-    upstream_has_cache: bool,
-    has_patch_target: bool,
-    defer_remaining_events: bool,
-    deferred_events: Vec<PendingSseEvent>,
-}
-
-struct PendingSseEvent {
-    lines: Vec<PendingSseLine>,
-}
-
-async fn stream_sse_with_deferred_cache(
-    upstream: reqwest::Response,
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    cache_preview: &CacheResult,
-) -> StreamedSseState {
-    let mut byte_stream = upstream.bytes_stream();
-    let mut byte_buffer: Vec<u8> = Vec::new();
-    let mut event_lines = Vec::new();
-    let mut state = StreamedSseState {
-        is_complete: true,
-        upstream_has_cache: false,
-        has_patch_target: false,
-        defer_remaining_events: false,
-        deferred_events: Vec::new(),
-    };
-
-    while let Some(chunk_result) = byte_stream.next().await {
-        if tx.is_closed() {
-            state.is_complete = false;
-            return state;
-        }
-        let Ok(chunk) = chunk_result else {
-            state.is_complete = false;
-            break;
-        };
-        byte_buffer.extend_from_slice(&chunk);
-
-        while let Some(newline_pos) = byte_buffer.iter().position(|&b| b == b'\n') {
-            let line_bytes = byte_buffer[..newline_pos].to_vec();
-            byte_buffer = byte_buffer[newline_pos + 1..].to_vec();
-            let line = String::from_utf8_lossy(&line_bytes).into_owned();
-            event_lines.push(PendingSseLine {
-                line: line.clone(),
-                had_newline: true,
-            });
-            if !line.trim_end_matches('\r').is_empty() {
-                continue;
-            }
-
-            let event = PendingSseEvent {
-                lines: std::mem::take(&mut event_lines),
-            };
-            if !handle_sse_event_for_streaming(tx, &mut state, event, cache_preview).await {
-                state.is_complete = false;
-                return state;
-            }
-        }
-    }
-
-    if !byte_buffer.is_empty() && state.is_complete {
-        let line = String::from_utf8_lossy(&byte_buffer).into_owned();
-        event_lines.push(PendingSseLine {
-            line,
-            had_newline: false,
-        });
-    }
-
-    if !event_lines.is_empty() && state.is_complete {
-        let event = PendingSseEvent { lines: event_lines };
-        if !handle_sse_event_for_streaming(tx, &mut state, event, cache_preview).await {
-            state.is_complete = false;
-        }
-    }
-
+fn make_debug(state: &AppState, plan: &CachePlan) -> Option<CacheDebugSummary> {
     state
-}
-
-async fn handle_sse_event_for_streaming(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    state: &mut StreamedSseState,
-    event: PendingSseEvent,
-    cache_preview: &CacheResult,
-) -> bool {
-    if state.upstream_has_cache {
-        return send_sse_event(tx, event).await;
-    }
-
-    if sse_event_has_cache_usage_fields(&event) {
-        state.upstream_has_cache = true;
-        if !send_deferred_sse_events(tx, std::mem::take(&mut state.deferred_events), None).await {
-            return false;
-        }
-        return send_sse_event(tx, event).await;
-    }
-
-    if state.defer_remaining_events {
-        state.deferred_events.push(event);
-        return true;
-    }
-
-    if sse_event_is_patchable_start_usage(&event) {
-        state.has_patch_target = true;
-        return send_patched_sse_event(tx, event, cache_preview).await;
-    }
-
-    if sse_event_is_patchable_final_usage(&event) {
-        state.has_patch_target = true;
-        state.defer_remaining_events = true;
-        state.deferred_events.push(event);
-        return true;
-    }
-
-    if sse_event_is_done(&event) {
-        state.deferred_events.push(event);
-        return true;
-    }
-
-    send_sse_event(tx, event).await
-}
-
-fn sse_event_has_cache_usage_fields(event: &PendingSseEvent) -> bool {
-    event
-        .lines
-        .iter()
-        .any(|line| sse_line_has_cache_usage_fields(&line.line))
-}
-
-fn sse_event_is_patchable_start_usage(event: &PendingSseEvent) -> bool {
-    event
-        .lines
-        .iter()
-        .any(|line| sse_line_is_patchable_start_usage(&line.line))
-}
-
-fn sse_event_is_patchable_final_usage(event: &PendingSseEvent) -> bool {
-    event
-        .lines
-        .iter()
-        .any(|line| sse_line_is_patchable_final_usage(&line.line))
-}
-
-fn sse_event_is_done(event: &PendingSseEvent) -> bool {
-    event.lines.iter().any(|line| sse_line_is_done(&line.line))
-}
-
-async fn send_deferred_sse_events(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    events: Vec<PendingSseEvent>,
-    cache: Option<&CacheResult>,
-) -> bool {
-    for event in events {
-        let bytes = if let Some(cache) = cache {
-            patched_sse_event_bytes(&event, cache)
-        } else {
-            sse_event_bytes(&event)
-        };
-        if tx.send(Ok(bytes)).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
-async fn send_sse_event(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    event: PendingSseEvent,
-) -> bool {
-    tx.send(Ok(sse_event_bytes(&event))).await.is_ok()
-}
-
-async fn send_patched_sse_event(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    event: PendingSseEvent,
-    cache: &CacheResult,
-) -> bool {
-    tx.send(Ok(patched_sse_event_bytes(&event, cache)))
-        .await
-        .is_ok()
-}
-
-fn sse_event_bytes(event: &PendingSseEvent) -> Bytes {
-    Bytes::from(
-        event
-            .lines
-            .iter()
-            .flat_map(|line| sse_line_bytes(line).to_vec())
-            .collect::<Vec<u8>>(),
-    )
-}
-
-fn patched_sse_event_bytes(event: &PendingSseEvent, cache: &CacheResult) -> Bytes {
-    Bytes::from(
-        event
-            .lines
-            .iter()
-            .flat_map(|line| {
-                if sse_line_is_patchable_start_usage(&line.line)
-                    || sse_line_is_patchable_final_usage(&line.line)
-                {
-                    patched_sse_line_bytes(line, cache).to_vec()
-                } else {
-                    sse_line_bytes(line).to_vec()
-                }
-            })
-            .collect::<Vec<u8>>(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn patch_sse_event_text_for_test(event_text: &str, cache: &CacheResult) -> String {
-    let mut lines = Vec::new();
-    for segment in event_text.split_inclusive('\n') {
-        let had_newline = segment.ends_with('\n');
-        let line = segment.strip_suffix('\n').unwrap_or(segment).to_string();
-        lines.push(PendingSseLine { line, had_newline });
-    }
-
-    if !event_text.ends_with('\n') && lines.is_empty() {
-        lines.push(PendingSseLine {
-            line: event_text.to_string(),
-            had_newline: false,
-        });
-    }
-
-    let patched = patched_sse_event_bytes(&PendingSseEvent { lines }, cache);
-    String::from_utf8(patched.to_vec()).expect("patched SSE event should be UTF-8")
-}
-
-
-
-fn sse_line_bytes(line: &PendingSseLine) -> Bytes {
-    if line.had_newline {
-        Bytes::from(format!("{}\n", line.line))
-    } else {
-        Bytes::from(line.line.clone())
-    }
-}
-
-fn patched_sse_line_bytes(line: &PendingSseLine, cache: &CacheResult) -> Bytes {
-    let mut output = patch_sse_line(&line.line, cache);
-    if !line.had_newline && output.ends_with('\n') {
-        output.pop();
-    }
-    Bytes::from(output)
-}
-
-async fn passthrough_sse(
-    upstream: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) {
-    let mut byte_stream = upstream.bytes_stream();
-    while let Some(chunk_result) = byte_stream.next().await {
-        let Ok(chunk) = chunk_result else {
-            break;
-        };
-        if tx.send(Ok(chunk)).await.is_err() {
-            break;
-        }
-    }
-}
-
-pub(crate) fn should_apply_deferred_sse_cache(
-    is_complete: bool,
-    downstream_open: bool,
-    upstream_has_cache: bool,
-    has_patch_target: bool,
-) -> bool {
-    is_complete && downstream_open && !upstream_has_cache && has_patch_target
+        .debug_cache_keys
+        .then(|| cache_debug_summary(&plan.api_key, &plan.prefixes, &plan.breakpoints))
 }
 
 fn emit_cache_log(
@@ -575,36 +253,38 @@ fn emit_cache_log(
     status: u16,
     cache_log: Option<(bool, usize, CacheResult, Option<CacheDebugSummary>)>,
 ) {
-    if let Some((applied, breakpoint_count, result, debug)) = cache_log {
-        if let Some(debug_summary) = debug {
-            tracing::info!(
-                method = %method,
-                path = %path,
-                status = status,
-                cache_applied = applied,
-                breakpoints = breakpoint_count,
-                cache_read_input_tokens = result.cache_read_input_tokens,
-                cache_creation_input_tokens = result.cache_creation_input_tokens,
-                uncached_input_tokens = result.uncached_input_tokens,
-                api_key_hash = %debug_summary.api_key_hash,
-                prefix_count = debug_summary.prefix_count,
-                breakpoint_prefixes = %debug_summary.breakpoint_prefixes,
-                prefix_sample = %debug_summary.prefix_sample,
-                "cache calculation completed after proxy pass-through"
-            );
-        } else {
-            tracing::info!(
-                method = %method,
-                path = %path,
-                status = status,
-                cache_applied = applied,
-                breakpoints = breakpoint_count,
-                cache_read_input_tokens = result.cache_read_input_tokens,
-                cache_creation_input_tokens = result.cache_creation_input_tokens,
-                uncached_input_tokens = result.uncached_input_tokens,
-                "cache calculation completed after proxy pass-through"
-            );
-        }
+    let Some((applied, breakpoint_count, result, debug)) = cache_log else {
+        return;
+    };
+
+    if let Some(debug_summary) = debug {
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status = status,
+            cache_applied = applied,
+            breakpoints = breakpoint_count,
+            cache_read_input_tokens = result.cache_read_input_tokens,
+            cache_creation_input_tokens = result.cache_creation_input_tokens,
+            uncached_input_tokens = result.uncached_input_tokens,
+            api_key_hash = %debug_summary.api_key_hash,
+            prefix_count = debug_summary.prefix_count,
+            breakpoint_prefixes = %debug_summary.breakpoint_prefixes,
+            prefix_sample = %debug_summary.prefix_sample,
+            "cache calculation completed after proxy pass-through"
+        );
+    } else {
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status = status,
+            cache_applied = applied,
+            breakpoints = breakpoint_count,
+            cache_read_input_tokens = result.cache_read_input_tokens,
+            cache_creation_input_tokens = result.cache_creation_input_tokens,
+            uncached_input_tokens = result.uncached_input_tokens,
+            "cache calculation completed after proxy pass-through"
+        );
     }
 }
 

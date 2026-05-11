@@ -1,15 +1,16 @@
 use crate::cache::{
-    CacheResult, MemoryCache, compute_cache_path, compute_request_cache_plan, count_all_tokens,
-    extract_api_key, lookup_or_create, purge_expired_entries,
+    CacheResult, MemoryCache, compute_request_cache_plan, extract_api_key, lookup_or_create,
+    purge_expired_entries,
 };
+use crate::cache_plan::{compute_cache_path, count_all_tokens};
 use crate::cch::strip_cch_from_request_body;
 use crate::config::{Args, Config, first_non_empty};
-use crate::proxy::{patch_sse_event_text_for_test, should_apply_deferred_sse_cache};
 use crate::response_patch::{
     extract_sse_data, inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
     sse_line_has_cache_usage_fields, sse_line_is_patchable_final_usage,
     sse_line_is_patchable_start_usage,
 };
+use crate::sse::{patch_sse_event_text_for_test, should_apply_deferred_sse_cache};
 use axum::body::Bytes;
 use http::{HeaderMap, Method, header};
 use serde_json::{Value, json};
@@ -508,7 +509,7 @@ fn injects_json_usage_cache_fields() {
     let value: Value = serde_json::from_slice(&patched).expect("valid patched JSON");
     assert_eq!(value["usage"]["cache_read_input_tokens"], 3);
     assert_eq!(value["usage"]["cache_creation_input_tokens"], 4);
-    assert_eq!(value["usage"]["input_tokens"], 5);
+    assert_eq!(value["usage"]["input_tokens"], 123 - 3 - 4);
 }
 
 #[test]
@@ -531,36 +532,38 @@ fn leaves_json_usage_unchanged_when_upstream_already_has_cache_fields() {
 
 #[test]
 fn injects_sse_message_start_usage_cache_fields() {
-    let line = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}";
+    let line = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}";
     let cache = CacheResult {
         cache_read_input_tokens: 7,
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: 3,
         uncached_input_tokens: 1,
     };
 
     let patched = patch_sse_line(line, &cache);
     assert!(sse_line_is_patchable_start_usage(line));
     assert!(patched.contains("\"cache_read_input_tokens\":7"));
-    assert!(patched.contains("\"cache_creation_input_tokens\":0"));
+    assert!(patched.contains("\"cache_creation_input_tokens\":3"));
+    assert!(patched.contains("\"input_tokens\":90"));
 }
 
 #[test]
 fn sse_data_parsing_accepts_missing_space_after_colon() {
-    let line = "data:{\"type\":\"message_delta\",\"usage\":{\"input_tokens\":1}}";
+    let line = "data:{\"type\":\"message_delta\",\"usage\":{\"input_tokens\":20}}";
     let cache = CacheResult {
         cache_read_input_tokens: 7,
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: 3,
         uncached_input_tokens: 1,
     };
 
     assert_eq!(
         extract_sse_data(line),
-        Some("{\"type\":\"message_delta\",\"usage\":{\"input_tokens\":1}}")
+        Some("{\"type\":\"message_delta\",\"usage\":{\"input_tokens\":20}}")
     );
 
     let patched = patch_sse_line(line, &cache);
     assert!(patched.contains("\"cache_read_input_tokens\":7"));
-    assert!(patched.contains("\"cache_creation_input_tokens\":0"));
+    assert!(patched.contains("\"cache_creation_input_tokens\":3"));
+    assert!(patched.contains("\"input_tokens\":10"));
 }
 
 #[test]
@@ -598,12 +601,12 @@ fn sse_line_patching_handles_final_line_without_newline() {
 fn sse_event_patching_preserves_event_and_data_frame_together() {
     let event = concat!(
         "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6,\"input_tokens\":20}}\n",
         "\n",
     );
     let cache = CacheResult {
         cache_read_input_tokens: 7,
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: 3,
         uncached_input_tokens: 5,
     };
 
@@ -613,6 +616,7 @@ fn sse_event_patching_preserves_event_and_data_frame_together() {
     assert!(patched.ends_with("\n\n"));
     assert!(patched.contains("\"output_tokens\":6"));
     assert!(patched.contains("\"cache_read_input_tokens\":7"));
+    assert!(patched.contains("\"input_tokens\":10"));
 }
 
 #[test]
