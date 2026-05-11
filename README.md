@@ -19,6 +19,8 @@
 - `SIMULATE_CACHE=true`：根据 Claude `cache_control` 断点模拟并注入 `cache_creation_input_tokens`、`cache_read_input_tokens` 和调整后的 `input_tokens`。
 - `STRIP_CCH=true`：从 Claude Code 注入的 `x-anthropic-billing-header` 文本中剔除动态 `cch=...` 段，避免每次请求生成不同 cache hash。
 
+当上游响应没有自带 cache usage 字段时，上游返回的 `usage.input_tokens` 会被视为该响应的 total input tokens；模拟器只负责把这个 total 拆分为未缓存的 `input_tokens`、`cache_creation_input_tokens` 和 `cache_read_input_tokens`，保证三者之和仍等于上游 total。
+
 ## 构建
 
 ```bash
