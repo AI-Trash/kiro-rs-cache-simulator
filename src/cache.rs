@@ -58,6 +58,20 @@ pub(crate) struct CacheResult {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PreparedCacheUpdate {
+    pub(crate) result: CacheResult,
+    read: Option<CacheWrite>,
+    writes: Vec<CacheWrite>,
+}
+
+#[derive(Debug, Clone)]
+struct CacheWrite {
+    hash: String,
+    tokens: i32,
+    ttl_secs: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CacheDebugSummary {
     pub(crate) api_key_hash: String,
     pub(crate) prefix_count: usize,
@@ -200,10 +214,27 @@ pub(crate) async fn lookup_or_create(
     breakpoints: &[CacheBreakpoint],
     total_input_tokens: i32,
 ) -> CacheResult {
+    let prepared =
+        prepare_cache_update(cache, api_key, prefixes, breakpoints, total_input_tokens).await;
+    commit_prepared_cache_update(cache, api_key, &prepared).await;
+    prepared.result
+}
+
+pub(crate) async fn prepare_cache_update(
+    cache: &MemoryCache,
+    api_key: &str,
+    prefixes: &[CachePrefix],
+    breakpoints: &[CacheBreakpoint],
+    total_input_tokens: i32,
+) -> PreparedCacheUpdate {
     if prefixes.is_empty() || breakpoints.is_empty() {
-        return CacheResult {
-            uncached_input_tokens: total_input_tokens,
-            ..CacheResult::default()
+        return PreparedCacheUpdate {
+            result: CacheResult {
+                uncached_input_tokens: total_input_tokens,
+                ..CacheResult::default()
+            },
+            read: None,
+            writes: Vec::new(),
         };
     }
 
@@ -213,6 +244,7 @@ pub(crate) async fn lookup_or_create(
 
     let mut result = CacheResult::default();
     let mut read_tokens = 0;
+    let mut read = None;
 
     'lookup: for breakpoint in breakpoints.iter().rev() {
         let start = breakpoint.prefix_index;
@@ -220,9 +252,13 @@ pub(crate) async fn lookup_or_create(
         for prefix_index in (end..=start).rev() {
             let prefix = &prefixes[prefix_index];
             let key = cache_key(api_key, &prefix.hash);
-            if let Some(entry) = cache.get_mut(&key) {
-                entry.expires_at = now + Duration::from_secs(entry.ttl_secs);
+            if let Some(entry) = cache.get(&key) {
                 read_tokens = entry.tokens;
+                read = Some(CacheWrite {
+                    hash: prefix.hash.clone(),
+                    tokens: entry.tokens,
+                    ttl_secs: entry.ttl_secs,
+                });
                 break 'lookup;
             }
         }
@@ -230,17 +266,15 @@ pub(crate) async fn lookup_or_create(
     result.cache_read_input_tokens = read_tokens;
 
     let mut largest_written_tokens = read_tokens;
+    let mut writes = Vec::new();
     for breakpoint in breakpoints {
         let prefix = &prefixes[breakpoint.prefix_index];
         if prefix.tokens > read_tokens {
-            cache.insert(
-                cache_key(api_key, &prefix.hash),
-                CacheEntry {
-                    tokens: prefix.tokens,
-                    ttl_secs: breakpoint.ttl_secs,
-                    expires_at: now + Duration::from_secs(breakpoint.ttl_secs),
-                },
-            );
+            writes.push(CacheWrite {
+                hash: prefix.hash.clone(),
+                tokens: prefix.tokens,
+                ttl_secs: breakpoint.ttl_secs,
+            });
             largest_written_tokens = largest_written_tokens.max(prefix.tokens);
         }
     }
@@ -248,7 +282,44 @@ pub(crate) async fn lookup_or_create(
 
     let cached_tokens = result.cache_read_input_tokens + result.cache_creation_input_tokens;
     result.uncached_input_tokens = (total_input_tokens - cached_tokens).max(0);
-    result
+
+    PreparedCacheUpdate {
+        result,
+        read,
+        writes,
+    }
+}
+
+pub(crate) async fn commit_prepared_cache_update(
+    cache: &MemoryCache,
+    api_key: &str,
+    prepared: &PreparedCacheUpdate,
+) {
+    let mut cache = cache.lock().await;
+    let now = Instant::now();
+    remove_expired_entries(&mut cache, now);
+
+    if let Some(read) = &prepared.read {
+        cache.insert(
+            cache_key(api_key, &read.hash),
+            CacheEntry {
+                tokens: read.tokens,
+                ttl_secs: read.ttl_secs,
+                expires_at: now + Duration::from_secs(read.ttl_secs),
+            },
+        );
+    }
+
+    for write in &prepared.writes {
+        cache.insert(
+            cache_key(api_key, &write.hash),
+            CacheEntry {
+                tokens: write.tokens,
+                ttl_secs: write.ttl_secs,
+                expires_at: now + Duration::from_secs(write.ttl_secs),
+            },
+        );
+    }
 }
 
 fn cache_key(api_key: &str, hash: &str) -> String {

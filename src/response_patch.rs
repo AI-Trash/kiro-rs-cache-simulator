@@ -50,6 +50,14 @@ pub(crate) fn sse_line_has_cache_usage_fields(line: &str) -> bool {
 }
 
 pub(crate) fn sse_line_is_patchable_final_usage(line: &str) -> bool {
+    sse_line_is_patchable_usage_of_type(line, "message_delta")
+}
+
+pub(crate) fn sse_line_is_patchable_start_usage(line: &str) -> bool {
+    sse_line_is_patchable_usage_of_type(line, "message_start")
+}
+
+fn sse_line_is_patchable_usage_of_type(line: &str, event_type: &str) -> bool {
     let Some(data) = extract_sse_data(line) else {
         return false;
     };
@@ -58,13 +66,22 @@ pub(crate) fn sse_line_is_patchable_final_usage(line: &str) -> bool {
     }
     serde_json::from_str::<Value>(data)
         .map(|event| {
-            matches!(
-                event.get("type").and_then(Value::as_str),
-                Some("message_delta")
-            ) && event.get("usage").and_then(Value::as_object).is_some()
+            event.get("type").and_then(Value::as_str) == Some(event_type)
+                && event_usage(&event).is_some()
                 && !json_has_cache_usage_fields(&event)
         })
         .unwrap_or(false)
+}
+
+fn event_usage(event: &Value) -> Option<&Map<String, Value>> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("message_start") => event
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .and_then(Value::as_object),
+        Some("message_delta") => event.get("usage").and_then(Value::as_object),
+        _ => None,
+    }
 }
 
 pub(crate) fn sse_line_is_done(line: &str) -> bool {

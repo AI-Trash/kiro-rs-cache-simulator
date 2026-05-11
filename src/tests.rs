@@ -8,6 +8,7 @@ use crate::proxy::should_apply_deferred_sse_cache;
 use crate::response_patch::{
     extract_sse_data, inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
     sse_line_has_cache_usage_fields, sse_line_is_patchable_final_usage,
+    sse_line_is_patchable_start_usage,
 };
 use axum::body::Bytes;
 use http::{HeaderMap, Method, header};
@@ -538,6 +539,7 @@ fn injects_sse_message_start_usage_cache_fields() {
     };
 
     let patched = patch_sse_line(line, &cache);
+    assert!(sse_line_is_patchable_start_usage(line));
     assert!(patched.contains("\"cache_read_input_tokens\":7"));
     assert!(patched.contains("\"cache_creation_input_tokens\":0"));
 }

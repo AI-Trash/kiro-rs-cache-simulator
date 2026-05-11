@@ -1,11 +1,13 @@
 use crate::cache::{
     CacheDebugSummary, CachePlan, CacheResult, MemoryCache, cache_debug_summary,
-    compute_request_cache_plan, extract_api_key, lookup_or_create,
+    commit_prepared_cache_update, compute_request_cache_plan, extract_api_key, lookup_or_create,
+    prepare_cache_update,
 };
 use crate::cch::strip_cch_from_request_body;
 use crate::response_patch::{
     inject_json_cache_fields, patch_sse_line, response_has_cache_usage_fields,
     sse_line_has_cache_usage_fields, sse_line_is_done, sse_line_is_patchable_final_usage,
+    sse_line_is_patchable_start_usage,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -213,8 +215,17 @@ async fn handle_sse_streaming(
     }
 
     tokio::spawn(async move {
+        let prepared = prepare_cache_update(
+            &state_for_task.cache,
+            &plan_for_log.api_key,
+            &plan_for_log.prefixes,
+            &plan_for_log.breakpoints,
+            plan_for_log.total_input_tokens,
+        )
+        .await;
+        let preview = prepared.result.clone();
         let mut cache_result: Option<CacheResult> = None;
-        let streamed = stream_sse_with_deferred_cache(upstream, &tx).await;
+        let streamed = stream_sse_with_deferred_cache(upstream, &tx, &preview).await;
         let should_apply_cache = should_apply_deferred_sse_cache(
             streamed.is_complete,
             !tx.is_closed(),
@@ -223,14 +234,9 @@ async fn handle_sse_streaming(
         );
 
         if should_apply_cache {
-            let result = lookup_or_create(
-                &state_for_task.cache,
-                &plan_for_log.api_key,
-                &plan_for_log.prefixes,
-                &plan_for_log.breakpoints,
-                plan_for_log.total_input_tokens,
-            )
-            .await;
+            commit_prepared_cache_update(&state_for_task.cache, &plan_for_log.api_key, &prepared)
+                .await;
+            let result = preview;
             send_deferred_sse_lines(&tx, streamed.deferred_lines, Some(&result)).await;
             cache_result = Some(result);
         } else {
@@ -301,6 +307,7 @@ struct StreamedSseState {
 async fn stream_sse_with_deferred_cache(
     upstream: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    cache_preview: &CacheResult,
 ) -> StreamedSseState {
     let mut byte_stream = upstream.bytes_stream();
     let mut byte_buffer: Vec<u8> = Vec::new();
@@ -326,7 +333,7 @@ async fn stream_sse_with_deferred_cache(
             let line_bytes = byte_buffer[..newline_pos].to_vec();
             byte_buffer = byte_buffer[newline_pos + 1..].to_vec();
             let line = String::from_utf8_lossy(&line_bytes).into_owned();
-            if !handle_sse_line_for_streaming(tx, &mut state, line, true).await {
+            if !handle_sse_line_for_streaming(tx, &mut state, line, true, cache_preview).await {
                 state.is_complete = false;
                 return state;
             }
@@ -335,7 +342,7 @@ async fn stream_sse_with_deferred_cache(
 
     if !byte_buffer.is_empty() && state.is_complete {
         let line = String::from_utf8_lossy(&byte_buffer).into_owned();
-        if !handle_sse_line_for_streaming(tx, &mut state, line, false).await {
+        if !handle_sse_line_for_streaming(tx, &mut state, line, false, cache_preview).await {
             state.is_complete = false;
         }
     }
@@ -348,6 +355,7 @@ async fn handle_sse_line_for_streaming(
     state: &mut StreamedSseState,
     line: String,
     had_newline: bool,
+    cache_preview: &CacheResult,
 ) -> bool {
     if state.upstream_has_cache {
         return send_sse_line(tx, PendingSseLine { line, had_newline }).await;
@@ -359,6 +367,12 @@ async fn handle_sse_line_for_streaming(
             return false;
         }
         return send_sse_line(tx, PendingSseLine { line, had_newline }).await;
+    }
+
+    if sse_line_is_patchable_start_usage(&line) {
+        state.has_patch_target = true;
+        return send_patched_sse_line(tx, PendingSseLine { line, had_newline }, cache_preview)
+            .await;
     }
 
     if sse_line_is_patchable_final_usage(&line) {
@@ -402,6 +416,16 @@ async fn send_sse_line(
     line: PendingSseLine,
 ) -> bool {
     tx.send(Ok(sse_line_bytes(&line))).await.is_ok()
+}
+
+async fn send_patched_sse_line(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    line: PendingSseLine,
+    cache: &CacheResult,
+) -> bool {
+    tx.send(Ok(patched_sse_line_bytes(&line, cache)))
+        .await
+        .is_ok()
 }
 
 fn sse_line_bytes(line: &PendingSseLine) -> Bytes {
